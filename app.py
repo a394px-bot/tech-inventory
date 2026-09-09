@@ -136,7 +136,6 @@ selected_party = ""
 if role == "Инженер":
     selected_party = st.sidebar.selectbox("Выберите вашу партию:", parties)
 
-    # Сбрасываем ФИО в сессии, если пользователь переключил партию или перезагрузил страницу
     if "last_party" not in st.session_state or st.session_state["last_party"] != selected_party:
         st.session_state["last_party"] = selected_party
         st.session_state["engineer_name"] = ""
@@ -209,13 +208,14 @@ if role == "Инженер":
                     col1, col2 = st.columns(2)
                     with col1:
                         sel_inv = st.selectbox(
-                            "Поиск по инвентарному номеру", [""] + inv_list
+                            "Поиск по инвентарному номеру (из базы)", [""] + inv_list
                         )
                     with col2:
                         sel_ser = st.selectbox(
-                            "Или поиск по серийному номеру", [""] + ser_list
+                            "Или поиск по серийному номеру (из базы)", [""] + ser_list
                         )
 
+                    auto_model, auto_serial, auto_inv = "", "", ""
                     if sel_inv:
                         match = (
                             session.query(LaptopReference)
@@ -223,7 +223,7 @@ if role == "Инженер":
                             .first()
                         )
                         if match:
-                            model, serial, inv = (
+                            auto_model, auto_serial, auto_inv = (
                                 match.model,
                                 match.serial_number,
                                 match.inv_number,
@@ -235,18 +235,18 @@ if role == "Инженер":
                             .first()
                         )
                         if match:
-                            model, serial, inv = (
+                            auto_model, auto_serial, auto_inv = (
                                 match.model,
                                 match.serial_number,
                                 match.inv_number,
                             )
 
-                    st.info(
-                        f"📌 Данные ноутбука: Модель: **{model or 'Не выбрана'}** | Серийник: **{serial or '-'}** | Инвентарник: **{inv or '-'}**"
-                    )
+                    # Поля для модели, серийника и инвентарника с возможностью ручного ввода/корректировки
+                    model = st.text_input("Модель ноутбука (подтянется из базы или введите вручную)", value=auto_model)
+                    serial = st.text_input("Серийный номер", value=auto_serial)
+                    inv = st.text_input("Инвентарный номер", value=auto_inv)
 
                 elif cat == "Роутер Huawei":
-                    # Для Роутера Huawei убрана подкатегория модель
                     model = "Роутер Huawei"
                     serial = st.text_input("Серийный номер")
                     inv = st.text_input("Инвентарный номер")
@@ -277,7 +277,6 @@ if role == "Инженер":
                 )
 
                 if st.button("Сохранить позицию"):
-                    # Проверка: хотя бы один из трех параметров (модель, серийник, инвентарник) должен быть заполнен
                     is_model_valid = bool(model and model != "Роутер Huawei" and model != "Не указана")
                     is_serial_valid = bool(serial and serial != "-")
                     is_inv_valid = bool(inv and inv != "-")
@@ -309,7 +308,7 @@ if role == "Инженер":
                             quantity=1,
                             condition=condition,
                             engineer=current_engineer,
-                            date_updated="Sep 9, 2026 08:54 UTC",
+                            date_updated="Sep 9, 2026 09:03 UTC",
                         )
                         session.add(new_item)
                         session.commit()
@@ -334,7 +333,7 @@ if role == "Инженер":
                         quantity=qty,
                         condition=condition,
                         engineer=current_engineer,
-                        date_updated="Sep 9, 2026 08:54 UTC",
+                        date_updated="Sep 9, 2026 09:03 UTC",
                     )
                     session.add(new_item)
                     session.commit()
@@ -371,10 +370,10 @@ if role == "Инженер":
                     if item_to_move:
                         old_party = item_to_move.party
                         item_to_move.party = destination
-                        item_to_move.date_updated = "Sep 9, 2026 08:54 UTC"
+                        item_to_move.date_updated = "Sep 9, 2026 09:03 UTC"
 
                         history_entry = History(
-                            date="Sep 9, 2026 08:54 UTC",
+                            date="Sep 9, 2026 09:03 UTC",
                             equipment_info=f"{item_to_move.category} {item_to_move.model}",
                             from_where=old_party,
                             to_where=destination,
