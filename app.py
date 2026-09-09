@@ -1,5 +1,5 @@
-import os
 from datetime import datetime
+import os
 import pandas as pd
 import streamlit as st
 from sqlalchemy import Column, Integer, String, create_engine
@@ -99,10 +99,29 @@ init_laptop_db()
 
 # --- ИНТЕРФЕЙС STREAMLIT ---
 st.set_page_config(
-    page_title="Учет оргтехники полевых партий", page_icon="💻", layout="wide"
+    page_title="Учет оргтехники", page_icon="💻", layout="centered"
 )
 
-st.title("💻 Система учета оргтехники полевых инженеров")
+# Добавляем мобильные стили CSS для улучшения отображения на телефонах
+st.markdown(
+    """
+    <style>
+    @media (max-width: 768px) {
+        .stButton button {
+            width: 100%;
+            font-size: 16px;
+            padding: 10px;
+        }
+        .stSelectbox, .stTextInput, .stNumberInput {
+            font-size: 16px !important;
+        }
+    }
+    </style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.title("💻 Учет оргтехники полевых инженеров")
 
 parties = [f"Партия № {i}" for i in range(1, 32)]
 
@@ -136,27 +155,30 @@ selected_party = ""
 if role == "Инженер":
     selected_party = st.sidebar.selectbox("Выберите вашу партию:", parties)
 
-    if "last_party" not in st.session_state or st.session_state["last_party"] != selected_party:
+    if (
+        "last_party" not in st.session_state
+        or st.session_state["last_party"] != selected_party
+    ):
         st.session_state["last_party"] = selected_party
         st.session_state["engineer_name"] = ""
 
     current_engineer = st.sidebar.text_input(
-        "ФИО ответственного инженера:", 
+        "ФИО ответственного инженера:",
         value=st.session_state["engineer_name"],
-        key="eng_input_field"
+        key="eng_input_field",
     )
     st.session_state["engineer_name"] = current_engineer
 
 if role == "Инженер":
-    st.subheader(f"Управление техникой для: **{selected_party}**")
+    st.markdown(f"### Партия: **{selected_party}**")
 
     if not current_engineer:
         st.warning(
-            "⚠️ Пожалуйста, укажите ваше ФИО в боковой панели слева для продолжения работы!"
+            "⚠️ **Внимание!** Нажмите на стрелочку **> (меню)** в верхнем левом углу экрана и укажите ваше **ФИО** для продолжения работы!"
         )
     else:
         tab1, tab2, tab3 = st.tabs(
-            ["📋 Список техники", "➕ Добавить позицию", "🚚 Перемещение"]
+            ["📋 Список", "➕ Добавить", "🚚 Переместить"]
         )
 
         with tab1:
@@ -188,7 +210,7 @@ if role == "Инженер":
         with tab2:
             st.markdown("### Добавить оргтехнику")
             all_categories = cats_with_identifiers + cats_with_qty
-            cat = st.selectbox("Выберите категорию техники", all_categories)
+            cat = st.selectbox("Категория техники", all_categories)
 
             # Логика для техники с серийными/инвентарными номерами
             if cat in cats_with_identifiers:
@@ -205,15 +227,13 @@ if role == "Инженер":
                         if l.serial_number != "-"
                     ]
 
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        sel_inv = st.selectbox(
-                            "Поиск по инвентарному номеру (из базы)", [""] + inv_list
-                        )
-                    with col2:
-                        sel_ser = st.selectbox(
-                            "Или поиск по серийному номеру (из базы)", [""] + ser_list
-                        )
+                    # На смартфонах колонки лучше выстраивать вертикально или использовать по одному
+                    sel_inv = st.selectbox(
+                        "Поиск по инвентарному номеру (из базы)", [""] + inv_list
+                    )
+                    sel_ser = st.selectbox(
+                        "Или поиск по серийному номеру (из базы)", [""] + ser_list
+                    )
 
                     auto_model, auto_serial, auto_inv = "", "", ""
                     if sel_inv:
@@ -241,8 +261,11 @@ if role == "Инженер":
                                 match.inv_number,
                             )
 
-                    # Поля для модели, серийника и инвентарника с возможностью ручного ввода/корректировки
-                    model = st.text_input("Модель ноутбука (подтянется из базы или введите вручную)", value=auto_model)
+                    model = st.text_input(
+                        "Модель ноутбука",
+                        value=auto_model,
+                        placeholder="Введите или выберите выше",
+                    )
                     serial = st.text_input("Серийный номер", value=auto_serial)
                     inv = st.text_input("Инвентарный номер", value=auto_inv)
 
@@ -260,13 +283,11 @@ if role == "Инженер":
                     saved_models = [m.model for m in custom_db]
 
                     model = st.selectbox(
-                        "Выберите или введите новую модель",
+                        "Модель (из сохраненных или новая)",
                         [""] + saved_models,
                     )
                     if not model:
-                        model = st.text_input(
-                            "Или введите наименование/модель вручную:"
-                        )
+                        model = st.text_input("Или введите модель вручную:")
 
                     serial = st.text_input("Серийный номер")
                     inv = st.text_input("Инвентарный номер")
@@ -276,13 +297,21 @@ if role == "Инженер":
                     ["Отлично", "Хорошо", "Удовлетворительно", "Неисправно"],
                 )
 
-                if st.button("Сохранить позицию"):
-                    is_model_valid = bool(model and model != "Роутер Huawei" and model != "Не указана")
+                if st.button("Сохранить позицию", use_container_width=True):
+                    is_model_valid = bool(
+                        model
+                        and model != "Роутер Huawei"
+                        and model != "Не указана"
+                    )
                     is_serial_valid = bool(serial and serial != "-")
                     is_inv_valid = bool(inv and inv != "-")
 
-                    if not (is_model_valid or is_serial_valid or is_inv_valid):
-                        st.error("❌ Ошибка: Заполните хотя бы одно поле (Модель, Серийный номер или Инвентарный номер), чтобы сохранить позицию!")
+                    if not (
+                        is_model_valid or is_serial_valid or is_inv_valid
+                    ):
+                        st.error(
+                            "❌ Ошибка: Заполните хотя бы одно поле (Модель, Серийный или Инвентарный номер)!"
+                        )
                     else:
                         if cat not in ["Ноутбук", "Роутер Huawei"] and model:
                             existing = (
@@ -302,13 +331,17 @@ if role == "Инженер":
                         new_item = Equipment(
                             party=selected_party,
                             category=cat,
-                            model=model if model else "Роутер Huawei" if cat == "Роутер Huawei" else "Не указана",
+                            model=model
+                            if model
+                            else "Роутер Huawei"
+                            if cat == "Роутер Huawei"
+                            else "Не указана",
                             serial_number=serial if serial else "-",
                             inv_number=inv if inv else "-",
                             quantity=1,
                             condition=condition,
                             engineer=current_engineer,
-                            date_updated="Sep 9, 2026 09:03 UTC",
+                            date_updated="Sep 9, 2026 09:24 UTC",
                         )
                         session.add(new_item)
                         session.commit()
@@ -316,14 +349,15 @@ if role == "Инженер":
                         st.rerun()
 
             else:
-                # Логика для техники с количеством
                 qty = st.number_input("Количество (шт.)", min_value=1, value=1)
                 condition = st.selectbox(
                     "Состояние",
                     ["Отлично", "Хорошо", "Удовлетворительно", "Неисправно"],
                 )
 
-                if st.button("Сохранить количество"):
+                if st.button(
+                    "Сохранить количество", use_container_width=True
+                ):
                     new_item = Equipment(
                         party=selected_party,
                         category=cat,
@@ -333,7 +367,7 @@ if role == "Инженер":
                         quantity=qty,
                         condition=condition,
                         engineer=current_engineer,
-                        date_updated="Sep 9, 2026 09:03 UTC",
+                        date_updated="Sep 9, 2026 09:24 UTC",
                     )
                     session.add(new_item)
                     session.commit()
@@ -350,7 +384,7 @@ if role == "Инженер":
             )
             if not data.empty:
                 item_options = {
-                    f"{row.category} — Модель: {row.model} (Сер: {row.serial_number} / Инв: {row.inv_number})": row.id
+                    f"{row.category} — {row.model} (Сер: {row.serial_number})": row.id
                     for index, row in data.iterrows()
                 }
                 selected_item_label = st.selectbox(
@@ -360,7 +394,9 @@ if role == "Инженер":
                     "Куда переместить?", ["База"] + parties
                 )
 
-                if st.button("Подтвердить перемещение"):
+                if st.button(
+                    "Подтвердить перемещение", use_container_width=True
+                ):
                     item_id = item_options[selected_item_label]
                     item_to_move = (
                         session.query(Equipment)
@@ -370,10 +406,10 @@ if role == "Инженер":
                     if item_to_move:
                         old_party = item_to_move.party
                         item_to_move.party = destination
-                        item_to_move.date_updated = "Sep 9, 2026 09:03 UTC"
+                        item_to_move.date_updated = "Sep 9, 2026 09:24 UTC"
 
                         history_entry = History(
-                            date="Sep 9, 2026 09:03 UTC",
+                            date="Sep 9, 2026 09:24 UTC",
                             equipment_info=f"{item_to_move.category} {item_to_move.model}",
                             from_where=old_party,
                             to_where=destination,
@@ -400,7 +436,7 @@ elif role == "Администратор":
         history_data = pd.read_sql(session.query(History).statement, engine)
 
         tab_dash, tab_all, tab_hist = st.tabs(
-            ["📊 Сводка / Дашборд", "📁 Реестр всей техники", "📜 История перемещений"]
+            ["📊 Сводка", "📁 Реестр", "📜 История"]
         )
 
         with tab_dash:
@@ -424,7 +460,7 @@ elif role == "Администратор":
                 st.dataframe(all_data, use_container_width=True)
 
         with tab_hist:
-            st.markdown("### Журнал перемещений между партиями и базой")
+            st.markdown("### Журнал перемещений")
             if not history_data.empty:
                 st.dataframe(history_data, use_container_width=True)
             else:
@@ -433,8 +469,6 @@ elif role == "Администратор":
     else:
         if password != "":
             st.error("Неверный пароль администратора!")
-        st.warning(
-            "Введите пароль в боковой панели слева для доступа к административной панели."
-        )
+        st.warning("Введите пароль администратора в боковой панели слева.")
 
 session.close()
