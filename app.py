@@ -131,11 +131,22 @@ st.sidebar.header("Параметры сеанса")
 role = st.sidebar.selectbox("Режим работы:", ["Инженер", "Администратор"])
 
 current_engineer = ""
+selected_party = ""
+
 if role == "Инженер":
     selected_party = st.sidebar.selectbox("Выберите вашу партию:", parties)
+
+    # Сбрасываем ФИО в сессии, если пользователь переключил партию или перезагрузил страницу
+    if "last_party" not in st.session_state or st.session_state["last_party"] != selected_party:
+        st.session_state["last_party"] = selected_party
+        st.session_state["engineer_name"] = ""
+
     current_engineer = st.sidebar.text_input(
-        "ФИО ответственного инженера (вводится 1 раз):", value=""
+        "ФИО ответственного инженера:", 
+        value=st.session_state["engineer_name"],
+        key="eng_input_field"
     )
+    st.session_state["engineer_name"] = current_engineer
 
 if role == "Инженер":
     st.subheader(f"Управление техникой для: **{selected_party}**")
@@ -182,7 +193,7 @@ if role == "Инженер":
 
             # Логика для техники с серийными/инвентарными номерами
             if cat in cats_with_identifiers:
-                model, serial, inv = "", "", "",
+                model, serial, inv = "", "", ""
 
                 if cat == "Ноутбук":
                     laptops_db = session.query(LaptopReference).all()
@@ -208,9 +219,7 @@ if role == "Инженер":
                     if sel_inv:
                         match = (
                             session.query(LaptopReference)
-                            .filter(
-                                LaptopReference.inv_number == sel_inv
-                            )
+                            .filter(LaptopReference.inv_number == sel_inv)
                             .first()
                         )
                         if match:
@@ -222,9 +231,7 @@ if role == "Инженер":
                     elif sel_ser:
                         match = (
                             session.query(LaptopReference)
-                            .filter(
-                                LaptopReference.serial_number == sel_ser
-                            )
+                            .filter(LaptopReference.serial_number == sel_ser)
                             .first()
                         )
                         if match:
@@ -237,8 +244,14 @@ if role == "Инженер":
                     st.info(
                         f"📌 Данные ноутбука: Модель: **{model or 'Не выбрана'}** | Серийник: **{serial or '-'}** | Инвентарник: **{inv or '-'}**"
                     )
+
+                elif cat == "Роутер Huawei":
+                    # Для Роутера Huawei убрана подкатегория модель
+                    model = "Роутер Huawei"
+                    serial = st.text_input("Серийный номер")
+                    inv = st.text_input("Инвентарный номер")
+
                 else:
-                    # Подгружаем сохраненные модели для категории + стандартные
                     custom_db = (
                         session.query(CustomModels)
                         .filter(CustomModels.category == cat)
@@ -264,40 +277,47 @@ if role == "Инженер":
                 )
 
                 if st.button("Сохранить позицию"):
-                    if cat != "Ноутбук" and model:
-                        # Сохраняем кастомную модель в базу для будущих подсказок
-                        existing = (
-                            session.query(CustomModels)
-                            .filter(
-                                CustomModels.category == cat,
-                                CustomModels.model == model,
-                            )
-                            .first()
-                        )
-                        if not existing:
-                            session.add(
-                                CustomModels(category=cat, model=model)
-                            )
-                            session.commit()
+                    # Проверка: хотя бы один из трех параметров (модель, серийник, инвентарник) должен быть заполнен
+                    is_model_valid = bool(model and model != "Роутер Huawei" and model != "Не указана")
+                    is_serial_valid = bool(serial and serial != "-")
+                    is_inv_valid = bool(inv and inv != "-")
 
-                    new_item = Equipment(
-                        party=selected_party,
-                        category=cat,
-                        model=model if model else "Не указана",
-                        serial_number=serial if serial else "-",
-                        inv_number=inv if inv else "-",
-                        quantity=1,
-                        condition=condition,
-                        engineer=current_engineer,
-                        date_updated="Sep 9, 2026 08:34 UTC",
-                    )
-                    session.add(new_item)
-                    session.commit()
-                    st.success("Успешно добавлено!")
-                    st.rerun()
+                    if not (is_model_valid or is_serial_valid or is_inv_valid):
+                        st.error("❌ Ошибка: Заполните хотя бы одно поле (Модель, Серийный номер или Инвентарный номер), чтобы сохранить позицию!")
+                    else:
+                        if cat not in ["Ноутбук", "Роутер Huawei"] and model:
+                            existing = (
+                                session.query(CustomModels)
+                                .filter(
+                                    CustomModels.category == cat,
+                                    CustomModels.model == model,
+                                )
+                                .first()
+                            )
+                            if not existing:
+                                session.add(
+                                    CustomModels(category=cat, model=model)
+                                )
+                                session.commit()
+
+                        new_item = Equipment(
+                            party=selected_party,
+                            category=cat,
+                            model=model if model else "Роутер Huawei" if cat == "Роутер Huawei" else "Не указана",
+                            serial_number=serial if serial else "-",
+                            inv_number=inv if inv else "-",
+                            quantity=1,
+                            condition=condition,
+                            engineer=current_engineer,
+                            date_updated="Sep 9, 2026 08:54 UTC",
+                        )
+                        session.add(new_item)
+                        session.commit()
+                        st.success("Успешно добавлено!")
+                        st.rerun()
 
             else:
-                # Логика для техники с количеством (ПК, мониторы, кабели)
+                # Логика для техники с количеством
                 qty = st.number_input("Количество (шт.)", min_value=1, value=1)
                 condition = st.selectbox(
                     "Состояние",
@@ -314,7 +334,7 @@ if role == "Инженер":
                         quantity=qty,
                         condition=condition,
                         engineer=current_engineer,
-                        date_updated="Sep 9, 2026 08:34 UTC",
+                        date_updated="Sep 9, 2026 08:54 UTC",
                     )
                     session.add(new_item)
                     session.commit()
@@ -351,10 +371,10 @@ if role == "Инженер":
                     if item_to_move:
                         old_party = item_to_move.party
                         item_to_move.party = destination
-                        item_to_move.date_updated = "Sep 9, 2026 08:34 UTC"
+                        item_to_move.date_updated = "Sep 9, 2026 08:54 UTC"
 
                         history_entry = History(
-                            date="Sep 9, 2026 08:34 UTC",
+                            date="Sep 9, 2026 08:54 UTC",
                             equipment_info=f"{item_to_move.category} {item_to_move.model}",
                             from_where=old_party,
                             to_where=destination,
