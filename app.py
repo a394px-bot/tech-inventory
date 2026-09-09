@@ -1,4 +1,5 @@
 from datetime import datetime
+import io
 import os
 import pandas as pd
 import streamlit as st
@@ -102,7 +103,7 @@ st.set_page_config(
     page_title="Учет оргтехники", page_icon="💻", layout="centered"
 )
 
-# Добавляем мобильные стили CSS для улучшения отображения на телефонах
+# Добавляем мобильные стили CSS
 st.markdown(
     """
     <style>
@@ -128,16 +129,16 @@ parties = [f"Партия № {i}" for i in range(1, 32)]
 cats_with_identifiers = [
     "Ноутбук",
     "Роутер Huawei",
-    "Коммутатор",
-    "МФУ",
+    "Коммутатор/хаб для обменника",
+    "МФУ/Принтер",
     "Усилитель сотовой связи",
-    "Телефон",
+    "Сотовый телефон",
     "Стабилизатор напряжения",
     "ИБП",
 ]
 
 cats_with_qty = [
-    "ПК",
+    "ПК/Системный блок",
     "Монитор",
     "Сетевой фильтр",
     "Lan кабель 50 метров",
@@ -212,6 +213,17 @@ if role == "Инженер":
             all_categories = cats_with_identifiers + cats_with_qty
             cat = st.selectbox("Категория техники", all_categories)
 
+            # Выбор состояния и обязательный комментарий при неудовлетворительном
+            cond_option = st.selectbox(
+                "Состояние", ["Удовлетворительно", "Не удовлетворительно"]
+            )
+            if cond_option == "Не удовлетворительно":
+                cond_comment = st.text_input(
+                    "⚠️ Опишите неисправность (обязательно):"
+                )
+            else:
+                cond_comment = "Удовлетворительно"
+
             # Логика для техники с серийными/инвентарными номерами
             if cat in cats_with_identifiers:
                 model, serial, inv = "", "", ""
@@ -227,7 +239,6 @@ if role == "Инженер":
                         if l.serial_number != "-"
                     ]
 
-                    # На смартфонах колонки лучше выстраивать вертикально или использовать по одному
                     sel_inv = st.selectbox(
                         "Поиск по инвентарному номеру (из базы)", [""] + inv_list
                     )
@@ -292,87 +303,97 @@ if role == "Инженер":
                     serial = st.text_input("Серийный номер")
                     inv = st.text_input("Инвентарный номер")
 
-                condition = st.selectbox(
-                    "Состояние",
-                    ["Отлично", "Хорошо", "Удовлетворительно", "Неисправно"],
-                )
-
                 if st.button("Сохранить позицию", use_container_width=True):
-                    is_model_valid = bool(
-                        model
-                        and model != "Роутер Huawei"
-                        and model != "Не указана"
-                    )
-                    is_serial_valid = bool(serial and serial != "-")
-                    is_inv_valid = bool(inv and inv != "-")
-
-                    if not (
-                        is_model_valid or is_serial_valid or is_inv_valid
+                    if (
+                        cond_option == "Не удовлетворительно"
+                        and not cond_comment.strip()
                     ):
                         st.error(
-                            "❌ Ошибка: Заполните хотя бы одно поле (Модель, Серийный или Инвентарный номер)!"
+                            "❌ Ошибка: Обязательно укажите описание неисправности!"
                         )
                     else:
-                        if cat not in ["Ноутбук", "Роутер Huawei"] and model:
-                            existing = (
-                                session.query(CustomModels)
-                                .filter(
-                                    CustomModels.category == cat,
-                                    CustomModels.model == model,
-                                )
-                                .first()
-                            )
-                            if not existing:
-                                session.add(
-                                    CustomModels(category=cat, model=model)
-                                )
-                                session.commit()
+                        is_model_valid = bool(
+                            model
+                            and model != "Роутер Huawei"
+                            and model != "Не указана"
+                        )
+                        is_serial_valid = bool(serial and serial != "-")
+                        is_inv_valid = bool(inv and inv != "-")
 
+                        if not (
+                            is_model_valid or is_serial_valid or is_inv_valid
+                        ):
+                            st.error(
+                                "❌ Ошибка: Заполните хотя бы одно поле (Модель, Серийный или Инвентарный номер)!"
+                            )
+                        else:
+                            if (
+                                cat not in ["Ноутбук", "Роутер Huawei"]
+                                and model
+                            ):
+                                existing = (
+                                    session.query(CustomModels)
+                                    .filter(
+                                        CustomModels.category == cat,
+                                        CustomModels.model == model,
+                                    )
+                                    .first()
+                                )
+                                if not existing:
+                                    session.add(
+                                        CustomModels(category=cat, model=model)
+                                    )
+                                    session.commit()
+
+                            new_item = Equipment(
+                                party=selected_party,
+                                category=cat,
+                                model=model
+                                if model
+                                else "Роутер Huawei"
+                                if cat == "Роутер Huawei"
+                                else "Не указана",
+                                serial_number=serial if serial else "-",
+                                inv_number=inv if inv else "-",
+                                quantity=1,
+                                condition=cond_comment,
+                                engineer=current_engineer,
+                                date_updated="Sep 9, 2026 10:37 UTC",
+                            )
+                            session.add(new_item)
+                            session.commit()
+                            st.success("Успешно добавлено!")
+                            st.rerun()
+
+            else:
+                qty = st.number_input("Количество (шт.)", min_value=1, value=1)
+
+                if st.button(
+                    "Сохранить количество", use_container_width=True
+                ):
+                    if (
+                        cond_option == "Не удовлетворительно"
+                        and not cond_comment.strip()
+                    ):
+                        st.error(
+                            "❌ Ошибка: Обязательно укажите описание неисправности!"
+                        )
+                    else:
                         new_item = Equipment(
                             party=selected_party,
                             category=cat,
-                            model=model
-                            if model
-                            else "Роутер Huawei"
-                            if cat == "Роутер Huawei"
-                            else "Не указана",
-                            serial_number=serial if serial else "-",
-                            inv_number=inv if inv else "-",
-                            quantity=1,
-                            condition=condition,
+                            model=cat,
+                            serial_number="-",
+                            inv_number="-",
+                            quantity=qty,
+                            condition=cond_comment,
                             engineer=current_engineer,
-                            date_updated="Sep 9, 2026 09:24 UTC",
+                            date_updated="Sep 9, 2026 10:37 UTC",
                         )
                         session.add(new_item)
                         session.commit()
                         st.success("Успешно добавлено!")
                         st.rerun()
-
-            else:
-                qty = st.number_input("Количество (шт.)", min_value=1, value=1)
-                condition = st.selectbox(
-                    "Состояние",
-                    ["Отлично", "Хорошо", "Удовлетворительно", "Неисправно"],
-                )
-
-                if st.button(
-                    "Сохранить количество", use_container_width=True
-                ):
-                    new_item = Equipment(
-                        party=selected_party,
-                        category=cat,
-                        model=cat,
-                        serial_number="-",
-                        inv_number="-",
-                        quantity=qty,
-                        condition=condition,
-                        engineer=current_engineer,
-                        date_updated="Sep 9, 2026 09:24 UTC",
-                    )
-                    session.add(new_item)
-                    session.commit()
-                    st.success("Успешно добавлено!")
-                    st.rerun()
 
         with tab3:
             st.markdown("### Перемещение техники")
@@ -406,10 +427,10 @@ if role == "Инженер":
                     if item_to_move:
                         old_party = item_to_move.party
                         item_to_move.party = destination
-                        item_to_move.date_updated = "Sep 9, 2026 09:24 UTC"
+                        item_to_move.date_updated = "Sep 9, 2026 10:37 UTC"
 
                         history_entry = History(
-                            date="Sep 9, 2026 09:24 UTC",
+                            date="Sep 9, 2026 10:37 UTC",
                             equipment_info=f"{item_to_move.category} {item_to_move.model}",
                             from_where=old_party,
                             to_where=destination,
@@ -451,6 +472,18 @@ elif role == "Администратор":
                     index="party", columns="category", values="quantity"
                 ).fillna(0)
                 st.dataframe(pivot_summary, use_container_width=True)
+
+                # Выгрузка дашборда в Excel
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                    pivot_summary.to_excel(writer, sheet_name="Сводка")
+                output.seek(0)
+                st.download_button(
+                    label="📥 Скачать сводку в Excel",
+                    data=output,
+                    file_name="dashboard_summary.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
             else:
                 st.warning("В базе пока нет записей.")
 
@@ -459,10 +492,61 @@ elif role == "Администратор":
             if not all_data.empty:
                 st.dataframe(all_data, use_container_width=True)
 
+                # Выгрузка общего списка в Excel
+                output_all = io.BytesIO()
+                with pd.ExcelWriter(output_all, engine="openpyxl") as writer:
+                    all_data.to_excel(writer, index=False, sheet_name="Реестр")
+                output_all.seek(0)
+                st.download_button(
+                    label="📥 Скачать полный реестр в Excel",
+                    data=output_all,
+                    file_name="all_equipment_registry.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+                st.markdown("---")
+                st.markdown("### Удаление позиции из реестра")
+                del_options = {
+                    f"ID {row.id} | Партия: {row.party} | {row.category} — {row.model} (Сер: {row.serial_number})": row.id
+                    for _, row in all_data.iterrows()
+                }
+                selected_del_label = st.selectbox(
+                    "Выберите позицию для удаления:", list(del_options.keys())
+                )
+                if st.button("🗑️ Удалить выбранную позицию"):
+                    item_id_to_del = del_options[selected_del_label]
+                    session.query(Equipment).filter(
+                        Equipment.id == item_id_to_del
+                    ).delete()
+                    session.commit()
+                    st.success("Позиция успешно удалена!")
+                    st.rerun()
+            else:
+                st.info("Реестр пуст.")
+
         with tab_hist:
             st.markdown("### Журнал перемещений")
             if not history_data.empty:
                 st.dataframe(history_data, use_container_width=True)
+
+                st.markdown("---")
+                st.markdown("### Удаление записей истории")
+                hist_del_options = {
+                    f"ID {row.id} | Дата: {row.date} | {row.equipment_info} ({row.from_where} ➔ {row.to_where})": row.id
+                    for _, row in history_data.iterrows()
+                }
+                selected_hist_label = st.selectbox(
+                    "Выберите запись истории для удаления:",
+                    list(hist_del_options.keys()),
+                )
+                if st.button("🗑️ Удалить выбранную запись истории"):
+                    hist_id_to_del = hist_del_options[selected_hist_label]
+                    session.query(History).filter(
+                        History.id == hist_id_to_del
+                    ).delete()
+                    session.commit()
+                    st.success("Запись истории успешно удалена!")
+                    st.rerun()
             else:
                 st.info("История перемещений пуста.")
 
