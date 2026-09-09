@@ -249,7 +249,7 @@ st.markdown(
         opacity: 0.65;
     }
 
-    /* Бейдж партии */
+    /* Бейдж партии (цвет задан явно — не зависит от темы Streamlit) */
     .party-chip {
         display: inline-flex;
         align-items: center;
@@ -258,10 +258,22 @@ st.markdown(
         border-radius: 999px;
         font-weight: 700;
         font-size: 0.95rem;
-        color: var(--primary-color);
-        background: color-mix(in srgb, var(--primary-color) 13%, transparent);
-        border: 1px solid color-mix(in srgb, var(--primary-color) 30%, transparent);
+        color: #2f6fed;
+        background: rgba(47, 111, 237, 0.12);
+        border: 1px solid rgba(47, 111, 237, 0.32);
         margin-bottom: 0.6rem;
+    }
+
+    /* Основные кнопки и активные вкладки — фирменный синий */
+    button[kind="primary"], button[data-testid="stBaseButton-primary"] {
+        background-color: #2f6fed !important;
+    }
+    button[kind="primary"]:hover, button[data-testid="stBaseButton-primary"]:hover {
+        background-color: #285fd0 !important;
+    }
+    [data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] {
+        color: #2f6fed !important;
+        border-bottom: 2px solid #2f6fed !important;
     }
 
     /* Кнопки */
