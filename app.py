@@ -79,7 +79,8 @@ def validate_transfer_surnames(own_surname, receiver_surname, engineer_fio, matc
 
 # --- ПРАВИЛА И РАСЧЁТЫ ---
 # Лимит единиц техники одной категории в одной партии.
-# Ноутбуки и сетевые фильтры — не более 2 шт, остальная оргтехника — не более 1 шт.
+# Ноутбуки и сетевые фильтры — не более 2 шт, остальная оргтехника — не более 1 шт
+# (моноблок, ПК, монитор, ИБП и т.д. попадают под общее правило «не более 1»).
 LIMITS_SPECIAL = {"Ноутбук": 2, "Сетевой фильтр": 2}
 DEFAULT_LIMIT = 1
 BASE_PARTY = "База"
@@ -96,6 +97,22 @@ def is_bad_condition(value):
     return str(value).strip().lower() != "удовлетворительно"
 
 
+def condition_text(value):
+    """Читаемый текст состояния без служебного префикса."""
+    text = str(value).strip()
+    low = text.lower()
+    for prefix in (
+        "не удовлетворительно:",
+        "неудовлетворительно:",
+        "не удовлетворительно",
+        "неудовлетворительно",
+    ):
+        if low.startswith(prefix):
+            stripped = text[len(prefix):].strip(" :—-")
+            return stripped or "неудовлетворительное состояние"
+    return text
+
+
 def style_conditions(df, condition_col="Состояние"):
     """Красит строки с неудовлетворительным состоянием красным."""
     if df is None or df.empty:
@@ -104,6 +121,26 @@ def style_conditions(df, condition_col="Состояние"):
     def row_style(row):
         bad = is_bad_condition(row.get(condition_col, ""))
         return [BAD_ROW_STYLE if bad else "" for _ in row]
+
+    return df.style.apply(row_style, axis=1)
+
+
+def style_violations(df, bad_col="Неудовлетворительные"):
+    """Подсвечивает красным колонку с неудовлетворительной техникой."""
+    if df is None or df.empty:
+        return df
+
+    def row_style(row):
+        styles = []
+        for col in row.index:
+            value = str(row.get(col, ""))
+            if col == bad_col and value not in ("", "—"):
+                styles.append(
+                    "background-color: #ffe1e1; color: #a40000; font-weight: 600"
+                )
+            else:
+                styles.append("")
+        return styles
 
     return df.style.apply(row_style, axis=1)
 
@@ -129,7 +166,7 @@ def find_limit_violations(df, with_details=True):
     """
     cols = ["Партия", "Категория", "Кол-во", "Лимит", "Превышение"]
     if with_details:
-        cols.append("Позиции")
+        cols += ["Неудовлетворительные", "Позиции"]
     if df is None or df.empty or "party" not in df:
         return pd.DataFrame(columns=cols)
 
@@ -155,12 +192,22 @@ def find_limit_violations(df, with_details=True):
         }
         if with_details:
             parts = []
+            bad_parts = []
             for _, item in group.iterrows():
                 label = str(item.get("model", "")).strip() or category
                 serial = str(item.get("serial_number", "")).strip()
                 if serial and serial != "-":
                     label += f" (Сер: {serial})"
-                parts.append(f"{label} — {int(item['quantity'])} шт")
+                qty_text = f"{int(item['quantity'])} шт"
+                if is_bad_condition(item.get("condition", "")):
+                    bad_info = f"{label} — {condition_text(item.get('condition', ''))}"
+                    bad_parts.append(bad_info)
+                    parts.append(f"⛔ {bad_info} — {qty_text}")
+                else:
+                    parts.append(f"{label} — {qty_text}")
+            row["Неудовлетворительные"] = (
+                "; ".join(bad_parts) if bad_parts else "—"
+            )
             row["Позиции"] = "; ".join(parts)
         rows.append(row)
 
@@ -481,9 +528,12 @@ def build_dashboard_html(df):
     # Таблица превышений лимитов
     lim_rows = []
     for _, row in violations.iterrows():
+        bad_info = str(row.get("Неудовлетворительные", "—"))
         lim_rows.append([
             row["Партия"], row["Категория"], row["Кол-во"], row["Лимит"],
-            row["Превышение"], row.get("Позиции", ""),
+            row["Превышение"],
+            ("!" + bad_info) if bad_info not in ("", "—") else "—",
+            row.get("Позиции", ""),
         ])
 
     # Неудовлетворительные позиции
@@ -524,7 +574,8 @@ def build_dashboard_html(df):
             summary_rows.append([party] + [int(row[c]) for c in cat_cols])
 
     limit_block = (
-        _table(["Партия", "Категория", "Кол-во", "Лимит", "Превышение", "Позиции"],
+        _table(["Партия", "Категория", "Кол-во", "Лимит", "Превышение",
+                "Неудовлетворительные", "Позиции"],
                lim_rows, "Превышений лимитов нет — всё в норме ✅")
     )
     generated = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
@@ -1003,6 +1054,7 @@ parties = [f"Партия № {i}" for i in range(1, 32)]
 
 cats_with_identifiers = [
     "Ноутбук",
+    "Моноблок",
     "Роутер Huawei",
     "Коммутатор/хаб для обменника",
     "МФУ/Принтер",
@@ -1670,8 +1722,14 @@ elif role == "Администратор":
                 if violations.empty:
                     st.success("✅ Превышений лимитов нет.")
                 else:
+                    if (violations["Неудовлетворительные"] != "—").any():
+                        st.warning(
+                            "⚠️ В партиях с превышением лимита есть техника в "
+                            "неудовлетворительном состоянии — смотрите колонку "
+                            "«Неудовлетворительные»."
+                        )
                     st.dataframe(
-                        violations,
+                        style_violations(violations),
                         use_container_width=True,
                         hide_index=True,
                     )
