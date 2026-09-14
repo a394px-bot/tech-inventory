@@ -3,3 +3,4 @@
    openpyxl
    sqlalchemy
    qrcode
+psycopg2-binary
