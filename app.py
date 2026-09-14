@@ -1648,7 +1648,7 @@ elif role == "Администратор":
 
     # Пароль хранится в секретах Streamlit (App → Settings → Secrets → admin_password),
     # а не в коде. Если секрет не настроен — вход невозможен.
-    ADMIN_PASSWORD = st.secrets.get("admin_password", "")
+    ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "") or st.secrets.get("admin_password", "")
 
     if not ADMIN_PASSWORD:
         st.error(
