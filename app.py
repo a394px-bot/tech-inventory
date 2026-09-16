@@ -426,6 +426,14 @@ def render_item_card(item, session):
             f"{_esc(item.archived_at)} · {_esc(item.archived_by)}</td></tr>"
         )
 
+    # Когда и кем технику последний раз подтверждали по QR-коду.
+    confirmed_row = ""
+    if cell_text(item.confirmed_at):
+        confirmed_row = (
+            "<tr><td>Подтверждено</td><td>"
+            f"{_esc(item.confirmed_at)} · {_esc(item.confirmed_by)}</td></tr>"
+        )
+
     st.markdown(
         f"""
         <div class="item-card">
@@ -441,6 +449,7 @@ def render_item_card(item, session):
                     {_esc(item.condition)}</td></tr>
             {complect_row}
             {archive_row}
+            {confirmed_row}
             <tr><td>Ответственный</td><td>{_esc(item.engineer)}</td></tr>
             <tr><td>Обновлено</td><td>{_esc(item.date_updated)}</td></tr>
           </table>
@@ -469,6 +478,9 @@ def render_item_card(item, session):
         base = app_base_url()
         if base:
             st.markdown(f"[← Вернуться в приложение]({base}/)")
+
+    # Действия по QR-коду: подтвердить нахождение в партии или переместить.
+    render_item_actions(session, item)
 
     moves = (
         session.query(History)
@@ -838,6 +850,10 @@ class Equipment(Base):
     archived = Column(Integer, default=0)
     archived_at = Column(String)
     archived_by = Column(String)
+    # Подтверждение нахождения при сканировании QR-кода: кто и когда подтвердил,
+    # что техника действительно числится в этой партии.
+    confirmed_at = Column(String)
+    confirmed_by = Column(String)
 
 
 class LaptopReference(Base):
@@ -959,6 +975,10 @@ def migrate_equipment_schema():
             conn.execute(text("ALTER TABLE equipment ADD COLUMN archived_at VARCHAR"))
         if "archived_by" not in existing:
             conn.execute(text("ALTER TABLE equipment ADD COLUMN archived_by VARCHAR"))
+        if "confirmed_at" not in existing:
+            conn.execute(text("ALTER TABLE equipment ADD COLUMN confirmed_at VARCHAR"))
+        if "confirmed_by" not in existing:
+            conn.execute(text("ALTER TABLE equipment ADD COLUMN confirmed_by VARCHAR"))
 
 
 migrate_equipment_schema()
@@ -1021,6 +1041,168 @@ def archive_item(session, item, engineer, reason=""):
         reason or "Позиция списана в архив",
     )
     session.commit()
+
+
+# --- ДЕЙСТВИЯ ПО ПОЗИЦИИ ПРИ СКАНИРОВАНИИ QR-КОДА ---
+def move_item(session, item, destination, engineer, receiver):
+    """Переносит позицию в другую партию (или на «Базу») и фиксирует это в истории.
+
+    Используется и вкладкой «Переместить», и действием по QR-коду — чтобы
+    перемещение всегда записывалось одинаково: строка в истории перемещений
+    (откуда → куда, кто передал и кто принял) плюс запись в журнале действий.
+    """
+    old_party = item.party
+    item.party = destination
+    item.date_updated = utc_now_str()
+    session.add(
+        History(
+            date=utc_now_str(),
+            equipment_info=f"{item.category} {item.model}",
+            from_where=old_party,
+            to_where=destination,
+            engineer=engineer or "",
+            receiver=(receiver or "").strip(),
+            equipment_id=item.id,
+        )
+    )
+    log_action(
+        session,
+        "Перемещение",
+        item,
+        engineer,
+        f"{old_party} → {destination}",
+    )
+    session.commit()
+
+
+def confirm_item_location(session, item, engineer):
+    """Отмечает, что технику подтвердили в её партии (сканирование QR-кода)."""
+    item.confirmed_at = utc_now_str()
+    item.confirmed_by = engineer or ""
+    log_action(
+        session,
+        "Подтверждение",
+        item,
+        engineer,
+        f"Подтверждено нахождение в партии «{item.party}»",
+    )
+    session.commit()
+
+
+def apply_item_action(session, item, what, destination, actor_name, receiver, actor):
+    """Выполняет подтверждение или перемещение и показывает результат."""
+    if what == "Подтвердить, что техника здесь":
+        confirm_item_location(session, item, actor_name)
+        st.success(
+            f"✅ Подтверждено: техника находится в партии «{item.party}» "
+            f"({actor_name}). Запись добавлена в журнал действий."
+        )
+    else:
+        old_party = item.party
+        move_item(session, item, destination, actor_name, receiver)
+        st.success(
+            f"✅ Перемещено: «{old_party}» → «{destination}». "
+            f"Передал: {actor_name}. Принял: {(receiver or '').strip()}. "
+            "Запись добавлена в историю перемещений."
+        )
+    st.rerun()
+
+
+def render_item_actions(session, item):
+    """Действия по позиции при сканировании QR-кода.
+
+    Что можно сделать: подтвердить, что техника действительно в этой партии, или
+    переместить её в другую партию / на «Базу». Права (всё только с паролем):
+      * текущая партия — подтвердить нахождение и передать технику дальше;
+      * другая партия — принять технику к себе;
+      * администратор — подтвердить и переместить в любую партию.
+    """
+    st.markdown("---")
+    st.markdown("### ✅ Подтвердить или переместить")
+    st.caption(
+        f"Сейчас техника числится в партии «{item.party}». Подтвердить нахождение "
+        "может эта партия или администратор; другая партия может принять технику "
+        "к себе. Действие выполняется по паролю."
+    )
+
+    actor_options = [item.party, "Администратор"] + [
+        party for party in parties if party != item.party
+    ]
+    actor = st.selectbox(
+        "Кто выполняет действие:", actor_options, key=f"qr_actor_{item.id}"
+    )
+
+    what = st.radio(
+        "Что сделать:",
+        ["Подтвердить, что техника здесь", "Переместить"],
+        key=f"qr_what_{item.id}",
+    )
+
+    destination = ""
+    receiver = ""
+    if what == "Переместить":
+        if actor == item.party:
+            destination = st.selectbox(
+                "Куда передать:",
+                [BASE_PARTY] + [party for party in parties if party != item.party],
+                key=f"qr_dest_{item.id}",
+            )
+        elif actor == "Администратор":
+            destination = st.selectbox(
+                "Куда переместить:",
+                [BASE_PARTY] + [party for party in parties if party != item.party],
+                key=f"qr_dest_{item.id}",
+            )
+        else:
+            destination = actor
+            st.info(f"Техника будет принята в партию «{actor}».")
+        receiver = st.text_input(
+            "Фамилия принимающего (кому передаёте) *",
+            key=f"qr_receiver_{item.id}",
+        )
+
+    actor_name = st.text_input(
+        "Ваша фамилия (кто выполняет действие) *", key=f"qr_name_{item.id}"
+    )
+    actor_password = st.text_input(
+        "Пароль партии или администратора *",
+        type="password",
+        key=f"qr_password_{item.id}",
+    )
+
+    if st.button("Выполнить", type="primary", key=f"qr_go_{item.id}"):
+        actor_name = (actor_name or "").strip()
+        if not actor_name:
+            st.error("❌ Укажите фамилию — действие подписывается ею.")
+        elif not actor_password:
+            st.error("❌ Введите пароль.")
+        elif actor == "Администратор":
+            admin_password = secret_value("admin_password", "ADMIN_PASSWORD")
+            if not admin_password or not hmac.compare_digest(
+                actor_password.encode("utf-8"), admin_password.encode("utf-8")
+            ):
+                st.error("❌ Неверный пароль администратора.")
+            else:
+                apply_item_action(
+                    session, item, what, destination, actor_name, receiver,
+                    "Администратор",
+                )
+        elif not verify_party_login(session, actor, actor_password):
+            st.error(f"❌ Неверный пароль партии «{actor}».")
+        elif what == "Подтвердить, что техника здесь" and actor != item.party:
+            st.error(
+                "❌ Подтвердить нахождение может та партия, где техника сейчас, "
+                "или администратор. Вы можете принять технику к себе: выберите "
+                "«Переместить»."
+            )
+        elif what == "Переместить" and not destination:
+            st.error("❌ Выберите, куда переместить технику.")
+        elif what == "Переместить" and destination == item.party:
+            st.error("❌ Техника уже числится в этой партии.")
+        else:
+            apply_item_action(
+                session, item, what, destination, actor_name, receiver, actor
+            )
 
 
 def validate_complect(category, complect, complect_comment=""):
@@ -2365,21 +2547,13 @@ if role == "Инженер":
                                     "❌ Техника уже находится в этой партии. Выберите другое место."
                                 )
                             else:
-                                old_party = item_to_move.party
-                                item_to_move.party = destination
-                                item_to_move.date_updated = utc_now_str()
-
-                                history_entry = History(
-                                    date=utc_now_str(),
-                                    equipment_info=f"{item_to_move.category} {item_to_move.model}",
-                                    from_where=old_party,
-                                    to_where=destination,
-                                    engineer=current_engineer,
-                                    receiver=receiver_surname.strip(),
-                                    equipment_id=item_to_move.id,
+                                move_item(
+                                    session,
+                                    item_to_move,
+                                    destination,
+                                    current_engineer,
+                                    receiver_surname,
                                 )
-                                session.add(history_entry)
-                                session.commit()
                                 st.success("Перемещение выполнено успешно!")
                                 st.rerun()
             else:

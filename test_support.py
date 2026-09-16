@@ -133,6 +133,22 @@ def add_laptop_reference(db_path, model, serial, inv):
     )
 
 
+def add_party_password(db_path, party, password):
+    """Задаёт пароль ещё одной партии (для проверок прав)."""
+    db_execute(
+        db_path,
+        """CREATE TABLE IF NOT EXISTS party_access (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, party VARCHAR UNIQUE,
+            password_hash VARCHAR, updated_at VARCHAR)""",
+    )
+    db_execute(
+        db_path,
+        "INSERT OR REPLACE INTO party_access (party, password_hash, updated_at) "
+        "VALUES (?,?,?)",
+        (party, hash_like_app(password), "тест"),
+    )
+
+
 def app_run(db_path, params=None, script_path=None):
     os.environ["DATABASE_URL"] = "sqlite:///" + db_path.as_posix()
     at = AppTest.from_file(
