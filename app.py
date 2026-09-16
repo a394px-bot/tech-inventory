@@ -198,18 +198,24 @@ def laptops_summary(df):
     return category_summary(df, "Ноутбук")
 
 
-def category_stats_html(total_label, stats):
-    """Карточки «всего / исправны / неисправны» — тот же вид, что у ноутбуков."""
-    return (
-        '<div class="laptop-stats">'
-        f'<div class="ls-card"><div class="ls-val">{stats["total"]}</div>'
-        f'<div class="ls-label">{total_label}</div></div>'
-        f'<div class="ls-card ok"><div class="ls-val">{stats["ok"]}</div>'
-        '<div class="ls-label">Исправны</div></div>'
-        f'<div class="ls-card bad"><div class="ls-val">{stats["bad"]}</div>'
-        '<div class="ls-label">Неисправны</div></div>'
-        "</div>"
-    )
+def control_summary_table(df):
+    """Таблица «Техника под контролем» для выгрузок.
+
+    Колонки: категория / всего / исправны / неисправны. Нужна именно в скачиваемом
+    отчёте (HTML-дашборд и Excel), в сводке на экране эти цифры не дублируются.
+    """
+    rows = []
+    for category, _emoji, _label in CONTROL_CATEGORIES:
+        stats = category_summary(df, category)
+        rows.append(
+            {
+                "Категория": category,
+                "Всего": stats["total"],
+                "Исправны": stats["ok"],
+                "Неисправны": stats["bad"],
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def find_limit_violations(df, with_details=True):
@@ -640,15 +646,7 @@ def build_dashboard_html(df):
             ])
 
     # Техника под контролем (кроме ноутбуков): всего / исправны / неисправны
-    control_rows = []
-    for control_category, _control_emoji, _control_label in CONTROL_CATEGORIES:
-        control_stats = category_summary(df, control_category)
-        control_rows.append([
-            control_category,
-            control_stats["total"],
-            control_stats["ok"],
-            control_stats["bad"],
-        ])
+    control_rows = control_summary_table(df).values.tolist()
 
     # Сводка по партиям
     if df.empty:
@@ -1684,6 +1682,12 @@ ADD_FORM_KEYS = (
     "add_serial",
     "add_inv",
     "add_qty",
+    # поиск по базе ноутбуков и признак последней подстановки — иначе после
+    # сохранения поля снова заполнялись бы данными уже внесённого ноутбука
+    "add_search_inv",
+    "add_search_ser",
+    "add_last_picked",
+    "add_laptop_model",
 )
 
 if st.session_state.pop("reset_add_form", False):
@@ -2075,51 +2079,54 @@ if role == "Инженер":
                         if l.serial_number != "-"
                     ]
 
+                    # Подстановка модели, серийного и инвентарного номера ИЗ БАЗЫ —
+                    # только для ноутбуков (по просьбе заказчика). Значения пишем в
+                    # session_state ДО создания полей: если задавать их через value=,
+                    # Streamlit оставляет в поле прежнее значение — из-за этого
+                    # подтягивался серийный номер другой техники и поля «залипали».
                     sel_inv = st.selectbox(
-                        "Поиск по инвентарному номеру (из базы)", [""] + inv_list
+                        "Поиск по инвентарному номеру (из базы)",
+                        [""] + inv_list,
+                        key="add_search_inv",
                     )
                     sel_ser = st.selectbox(
-                        "Или поиск по серийному номеру (из базы)", [""] + ser_list
+                        "Или поиск по серийному номеру (из базы)",
+                        [""] + ser_list,
+                        key="add_search_ser",
                     )
 
-                    auto_model, auto_serial, auto_inv = "", "", ""
+                    picked, match = "", None
                     if sel_inv:
+                        picked = "inv:" + str(sel_inv)
                         match = (
                             session.query(LaptopReference)
                             .filter(LaptopReference.inv_number == sel_inv)
                             .first()
                         )
-                        if match:
-                            auto_model, auto_serial, auto_inv = (
-                                match.model,
-                                match.serial_number,
-                                match.inv_number,
-                            )
                     elif sel_ser:
+                        picked = "ser:" + str(sel_ser)
                         match = (
                             session.query(LaptopReference)
                             .filter(LaptopReference.serial_number == sel_ser)
                             .first()
                         )
-                        if match:
-                            auto_model, auto_serial, auto_inv = (
-                                match.model,
-                                match.serial_number,
-                                match.inv_number,
-                            )
+
+                    if (
+                        match is not None
+                        and st.session_state.get("add_last_picked") != picked
+                    ):
+                        st.session_state["add_last_picked"] = picked
+                        st.session_state["add_laptop_model"] = match.model or ""
+                        st.session_state["add_serial"] = match.serial_number or ""
+                        st.session_state["add_inv"] = match.inv_number or ""
 
                     model = st.text_input(
                         "Модель ноутбука",
-                        value=auto_model,
                         placeholder="Введите или выберите выше",
                         key="add_laptop_model",
                     )
-                    serial = st.text_input(
-                        "Серийный номер", value=auto_serial, key="add_serial"
-                    )
-                    inv = st.text_input(
-                        "Инвентарный номер", value=auto_inv, key="add_inv"
-                    )
+                    serial = st.text_input("Серийный номер", key="add_serial")
+                    inv = st.text_input("Инвентарный номер", key="add_inv")
 
                 elif cat == "Роутер Huawei":
                     model = "Роутер Huawei"
@@ -2247,7 +2254,8 @@ if role == "Инженер":
                                     f"Позиция добавлена: {new_item.category} — "
                                     f"{new_item.model} (серийный номер "
                                     f"{new_item.serial_number}), {new_item.party}. "
-                                    "Поля формы очищены — можно вносить следующую."
+                                    "Форма очищена: категория сброшена, поля пустые — "
+                                    "выберите категорию заново и внесите следующую."
                                 )
                                 session.commit()
                                 st.session_state["add_notice"] = notice_text
@@ -2294,7 +2302,8 @@ if role == "Инженер":
                         notice_text = (
                             f"Позиция добавлена: {new_item.category} — "
                             f"{new_item.quantity} шт, {new_item.party}. "
-                            "Поля формы очищены — можно вносить следующую."
+                            "Форма очищена: категория сброшена, поля пустые — "
+                            "выберите категорию заново и внесите следующую."
                         )
                         session.commit()
                         st.session_state["add_notice"] = notice_text
@@ -2450,19 +2459,28 @@ elif role == "Администратор":
                 # --- Ноутбуки: всего / исправны / неисправны ---
                 st.markdown("### 💻 Ноутбуки")
                 st.markdown(
-                    category_stats_html("Всего ноутбуков", lap),
+                    f"""
+                    <div class="laptop-stats">
+                      <div class="ls-card">
+                        <div class="ls-val">{lap["total"]}</div>
+                        <div class="ls-label">Всего ноутбуков</div>
+                      </div>
+                      <div class="ls-card ok">
+                        <div class="ls-val">{lap["ok"]}</div>
+                        <div class="ls-label">Исправны</div>
+                      </div>
+                      <div class="ls-card bad">
+                        <div class="ls-val">{lap["bad"]}</div>
+                        <div class="ls-label">Неисправны</div>
+                      </div>
+                    </div>
+                    """,
                     unsafe_allow_html=True,
                 )
-
-                # --- Прочая техника под контролем: всего / исправны / неисправны ---
-                st.markdown("### 🔧 Техника под контролем")
-                for control_category, control_emoji, control_label in CONTROL_CATEGORIES:
-                    control_stats = category_summary(all_data, control_category)
-                    st.markdown(f"#### {control_emoji} {control_category}")
-                    st.markdown(
-                        category_stats_html(control_label, control_stats),
-                        unsafe_allow_html=True,
-                    )
+                st.caption(
+                    "Разбивка по остальной технике (ИБП, стабилизаторы, усилители "
+                    "сотовой связи, роутеры Huawei) — в скачиваемых отчётах ниже."
+                )
 
                 # --- Превышение лимитов по партиям ---
                 st.markdown("### 🚫 Партии с превышением лимита")
@@ -2565,6 +2583,10 @@ elif role == "Администратор":
                             writer, sheet_name="Превышения лимитов",
                             index=False,
                         )
+                        control_summary_table(all_data).to_excel(
+                            writer, sheet_name="Техника под контролем",
+                            index=False,
+                        )
                         for ws in writer.book.worksheets:
                             for cell in ws[1]:
                                 cell.font = Font(bold=True)
@@ -2582,7 +2604,7 @@ elif role == "Администратор":
                                 ].width = min(max_len + 2, 42)
                     output.seek(0)
                     st.download_button(
-                        label="📥 Отчёт Excel (4 листа)",
+                        label="📥 Отчёт Excel (5 листов)",
                         data=output,
                         file_name="inventory_report.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2590,8 +2612,11 @@ elif role == "Администратор":
                     )
                 st.caption(
                     "HTML-дашборд открывается в браузере (графики, проценты, "
-                    "блоки превышений и неисправной техники), его можно "
-                    "распечатать в PDF: Ctrl+P → «Сохранить как PDF»."
+                    "блоки превышений и неисправной техники, таблица «Техника под "
+                    "контролем»), его можно распечатать в PDF: Ctrl+P → "
+                    "«Сохранить как PDF». В отчёте Excel — 5 листов, включая "
+                    "«Техника под контролем» (ИБП, стабилизаторы, усилители "
+                    "сотовой связи, роутеры Huawei: всего / исправны / неисправны)."
                 )
 
         with tab_all:

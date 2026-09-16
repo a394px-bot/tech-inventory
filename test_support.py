@@ -117,6 +117,22 @@ def add_item(db_path, party, category, model="Не указана", serial="-", 
     )
 
 
+def add_laptop_reference(db_path, model, serial, inv):
+    """Добавляет ноутбук в справочник (таблица, из которой идёт подстановка полей)."""
+    db_execute(
+        db_path,
+        """CREATE TABLE IF NOT EXISTS laptop_reference (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, model VARCHAR,
+            serial_number VARCHAR, inv_number VARCHAR)""",
+    )
+    db_execute(
+        db_path,
+        "INSERT INTO laptop_reference (model, serial_number, inv_number) "
+        "VALUES (?,?,?)",
+        (model, serial, inv),
+    )
+
+
 def app_run(db_path, params=None, script_path=None):
     os.environ["DATABASE_URL"] = "sqlite:///" + db_path.as_posix()
     at = AppTest.from_file(
