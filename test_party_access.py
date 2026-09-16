@@ -11,6 +11,7 @@
 import hashlib
 import os
 import secrets
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -86,10 +87,12 @@ def db_query(db_path, sql, params=()):
         con.close()
 
 
-def app_run(db_path, params=None):
+def app_run(db_path, params=None, script_path=None):
     """Запускает приложение на указанной базе; params — то, что стоит в ссылке."""
     os.environ["DATABASE_URL"] = "sqlite:///" + db_path.as_posix()
-    at = AppTest.from_file(str(HERE / "app.py"), default_timeout=120)
+    at = AppTest.from_file(
+        str(script_path or (HERE / "app.py")), default_timeout=120
+    )
     if params:
         for key, value in params.items():
             at.query_params[key] = value
@@ -248,6 +251,29 @@ else:
         check("пароли выданы всем 31 партии", issued == 31, f"записей: {issued}")
         check("показано предупреждение «пароли показываются один раз»",
               has_text(at4, "показываются один раз"))
+
+print("=== 10. Контейнер БЕЗ файла секретов (как на хостинге Timeweb) ===")
+# В контейнере secrets.toml нет, а st.secrets без файла не отдаёт значение по
+# умолчанию, а выбрасывает StreamlitSecretNotFoundError — из-за этого в проде
+# падала админка (Traceback на строке ADMIN_PASSWORD = st.secrets.get(...)).
+# Здесь запускаем приложение из папки без .streamlit: пароль идёт из переменной
+# окружения, страница не падает.
+sandbox = Path(tempfile.mkdtemp())
+shutil.copy(HERE / "app.py", sandbox / "app.py")
+os.environ["ADMIN_PASSWORD"] = "пароль-из-переменной"
+at5 = app_run(new_db_path(), script_path=sandbox / "app.py")
+check("приложение запускается без файла секретов", not at5.exception,
+      "; ".join(str(e.value)[:120] for e in at5.exception))
+at5.sidebar.selectbox[0].select("Администратор")
+at5.run()
+check("админка открывается без secrets.toml (раньше падала с Traceback)",
+      not at5.exception, "; ".join(str(e.value)[:120] for e in at5.exception))
+at5.sidebar.text_input[0].set_value("пароль-из-переменной")
+at5.run()
+check("пароль из переменной окружения ADMIN_PASSWORD принимается",
+      has_text(at5, "Пароли партий") and not at5.exception,
+      "; ".join(str(e.value)[:120] for e in at5.exception))
+del os.environ["ADMIN_PASSWORD"]
 
 print()
 print("ИТОГ:", sum(PASSED), "/", len(PASSED),

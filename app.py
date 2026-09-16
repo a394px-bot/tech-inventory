@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
-from sqlalchemy import Column, Integer, String, create_engine, inspect, text
+from sqlalchemy import Column, Integer, String, create_engine, inspect, or_, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -382,6 +382,15 @@ def render_item_card(item, session):
             "</td></tr>"
         )
 
+    # Статус архивной записи показываем, если позиция списана.
+    archive_row = ""
+    if is_archived(item):
+        archive_row = (
+            "<tr><td>Статус</td>"
+            '<td style="color:#b45309;font-weight:700">Списана в архив · '
+            f"{_esc(item.archived_at)} · {_esc(item.archived_by)}</td></tr>"
+        )
+
     st.markdown(
         f"""
         <div class="item-card">
@@ -396,6 +405,7 @@ def render_item_card(item, session):
                 <td style="color:{state_color};font-weight:700">
                     {_esc(item.condition)}</td></tr>
             {complect_row}
+            {archive_row}
             <tr><td>Ответственный</td><td>{_esc(item.engineer)}</td></tr>
             <tr><td>Обновлено</td><td>{_esc(item.date_updated)}</td></tr>
           </table>
@@ -731,14 +741,29 @@ def build_dashboard_html(df):
 </html>"""
 
 
+def secret_value(name, env_name, default=""):
+    """Секрет: сначала переменная окружения, потом st.secrets, иначе default.
+
+    Важно: если файла secrets.toml нет, `st.secrets.get()` НЕ отдаёт значение по
+    умолчанию, а выбрасывает StreamlitSecretNotFoundError — именно это роняло
+    админку в проде (в контейнере Timeweb файла секретов нет). Поэтому здесь
+    читаем безопасно и настраиваем приложение через переменные окружения.
+    """
+    value = os.environ.get(env_name, "")
+    if value:
+        return value
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
 # --- НАСТРОЙКА БАЗЫ ДАННЫХ ---
 # Приоритет: 1) переменная окружения DATABASE_URL; 2) секрет database_url
 # (Streamlit Cloud: App → Settings → Secrets) — постоянный Postgres;
 # 3) локальный SQLite-файл (запасной режим).
 DB_FILE = "inventory_v4.db"
-DATABASE_URL = os.environ.get("DATABASE_URL", "") or st.secrets.get(
-    "database_url", ""
-)
+DATABASE_URL = secret_value("database_url", "DATABASE_URL")
 if DATABASE_URL:
     engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
     IS_SQLITE = False
@@ -765,6 +790,11 @@ class Equipment(Base):
     # комментарий, что есть и чего не хватает, если не комплект.
     complect = Column(String)
     complect_comment = Column(String)
+    # Списание в архив вместо безвозвратного удаления: запись остаётся в базе,
+    # видно кто и когда её списал. Удалять навсегда может только администратор.
+    archived = Column(Integer, default=0)
+    archived_at = Column(String)
+    archived_by = Column(String)
 
 
 class LaptopReference(Base):
@@ -876,6 +906,16 @@ def migrate_equipment_schema():
             conn.execute(
                 text("ALTER TABLE equipment ADD COLUMN complect_comment VARCHAR")
             )
+        if "archived" not in existing:
+            conn.execute(text("ALTER TABLE equipment ADD COLUMN archived INTEGER"))
+            # Существующие позиции — в строю (иначе фильтр «не списан» их потеряет).
+            conn.execute(
+                text("UPDATE equipment SET archived = 0 WHERE archived IS NULL")
+            )
+        if "archived_at" not in existing:
+            conn.execute(text("ALTER TABLE equipment ADD COLUMN archived_at VARCHAR"))
+        if "archived_by" not in existing:
+            conn.execute(text("ALTER TABLE equipment ADD COLUMN archived_by VARCHAR"))
 
 
 migrate_equipment_schema()
@@ -910,6 +950,33 @@ def complect_display(complect, complect_comment=""):
     return value
 
 
+# --- СПИСАНИЕ В АРХИВ ---
+def active_items_filter():
+    """Условие «позиция в строю»: списанные в архив в списки и отчёты не попадают.
+    NULL трактуем как «в строю», чтобы старые записи не потерялись."""
+    return or_(Equipment.archived.is_(None), Equipment.archived != 1)
+
+
+def is_archived(item):
+    """Списана ли позиция в архив."""
+    return (getattr(item, "archived", 0) or 0) == 1
+
+
+def archive_item(session, item, engineer, reason=""):
+    """Списывает позицию в архив: запись остаётся, а в журнале видно кто и когда."""
+    item.archived = 1
+    item.archived_at = utc_now_str()
+    item.archived_by = engineer or ""
+    log_action(
+        session,
+        "Списание",
+        item,
+        engineer,
+        reason or "Позиция списана в архив",
+    )
+    session.commit()
+
+
 def validate_complect(category, complect, complect_comment=""):
     """Проверка комплектности. Возвращает (ok, текст ошибки)."""
     if not needs_complect(category):
@@ -926,8 +993,10 @@ def validate_complect(category, complect, complect_comment=""):
 def with_complect_column(df):
     """Добавляет колонку «Комплектность» сразу после «Состояния».
 
-    Показываем и сам факт (комплект/не комплект), и комментарий — чтобы в списке
-    сразу было видно, чего не хватает.
+    Показываем и факт (комплект / не комплект), и комментарий. Сырые колонки
+    `complect` / `complect_comment` убираем: иначе после переименования в таблице
+    оказывались две колонки с одинаковым названием, и оформление падало
+    («Styler.apply ... not compatible with non-unique index or columns»).
     """
     if df is None or df.empty:
         return df
@@ -946,6 +1015,13 @@ def with_complect_column(df):
         complect_display(complect, comment)
         for complect, comment in zip(complects, comments)
     ]
+    df = df.drop(
+        columns=[
+            column
+            for column in ("complect", "complect_comment")
+            if column in df.columns
+        ]
+    )
     if "condition" in df.columns:
         columns = list(df.columns)
         columns.remove(COMPLECT_COLUMN)
@@ -1611,6 +1687,7 @@ if role == "Инженер":
             data = pd.read_sql(
                 session.query(Equipment)
                 .filter(Equipment.party == selected_party)
+                .filter(active_items_filter())
                 .statement,
                 engine,
             )
@@ -1708,10 +1785,14 @@ if role == "Инженер":
                         save_clicked = st.form_submit_button(
                             "💾 Сохранить изменения", use_container_width=True
                         )
-                        st.markdown("**Удаление позиции**")
-                        confirm_del = st.checkbox("Подтверждаю удаление позиции")
+                        st.markdown("**Списание в архив**")
+                        st.caption(
+                            "Запись не стирается: техника уходит из списка, а в "
+                            "журнале остаётся, кто и когда её списал."
+                        )
+                        confirm_del = st.checkbox("Подтверждаю списание позиции")
                         delete_clicked = st.form_submit_button(
-                            "🗑️ Удалить позицию", use_container_width=True
+                            "📦 Списать в архив", use_container_width=True
                         )
 
                     if save_clicked:
@@ -1739,6 +1820,7 @@ if role == "Инженер":
                                     Equipment.serial_number
                                     == new_serial.strip(),
                                     Equipment.id != item.id,
+                                    active_items_filter(),
                                 )
                                 .first()
                             )
@@ -1806,22 +1888,20 @@ if role == "Инженер":
                     if delete_clicked:
                         if not confirm_del:
                             st.error(
-                                "❌ Отметьте «Подтверждаю удаление», чтобы "
-                                "удалить позицию."
+                                "❌ Отметьте «Подтверждаю списание», чтобы "
+                                "списать позицию в архив."
                             )
                         else:
-                            log_action(
+                            archive_item(
                                 session,
-                                "Удаление",
                                 item,
                                 current_engineer,
-                                "Позиция удалена инженером",
+                                "Позиция списана в архив инженером",
                             )
-                            session.query(Equipment).filter(
-                                Equipment.id == item.id
-                            ).delete()
-                            session.commit()
-                            st.success("Позиция удалена!")
+                            st.success(
+                                "Позиция списана в архив. Запись сохранена — "
+                                "её видно в журнале действий."
+                            )
                             st.rerun()
 
                     with st.expander("🏷 QR-код этой позиции"):
@@ -2010,7 +2090,10 @@ if role == "Инженер":
                             if serial and serial != "-":
                                 duplicate_item = (
                                     session.query(Equipment)
-                                    .filter(Equipment.serial_number == serial)
+                                    .filter(
+                                        Equipment.serial_number == serial,
+                                        active_items_filter(),
+                                    )
                                     .first()
                                 )
                             if duplicate_item:
@@ -2115,6 +2198,7 @@ if role == "Инженер":
             data = pd.read_sql(
                 session.query(Equipment)
                 .filter(Equipment.party == selected_party)
+                .filter(active_items_filter())
                 .statement,
                 engine,
             )
@@ -2187,14 +2271,17 @@ if role == "Инженер":
 elif role == "Администратор":
     st.sidebar.subheader("🔒 Авторизация администратора")
 
-    # Пароль хранится в секретах Streamlit (App → Settings → Secrets → admin_password),
-    # а не в коде. Если секрет не настроен — вход невозможен.
-    ADMIN_PASSWORD = st.secrets.get("admin_password", "")
+    # Пароль администратора берётся из переменной окружения (панель хостинга:
+    # Timeweb → приложение → «Переменные окружения» → ADMIN_PASSWORD) или из
+    # секретов Streamlit. В коде пароль не хранится. Нет пароля — вход закрыт.
+    ADMIN_PASSWORD = secret_value("admin_password", "ADMIN_PASSWORD")
 
     if not ADMIN_PASSWORD:
         st.error(
-            "Пароль администратора не настроен. Добавьте в секреты приложения "
-            "(`App → Settings → Secrets`) ключ `admin_password`, затем обновите страницу."
+            "Пароль администратора не настроен. Задайте переменную окружения "
+            "**ADMIN_PASSWORD** в панели хостинга (Timeweb → ваше приложение → "
+            "«Переменные окружения») или ключ `admin_password` в секретах, "
+            "затем обновите страницу."
         )
         st.stop()
 
@@ -2202,9 +2289,15 @@ elif role == "Администратор":
         "Введите пароль администратора", type="password"
     )
 
-    if password == ADMIN_PASSWORD:
+    # Сравниваем как байты: hmac.compare_digest не принимает строки с не-ASCII
+    # символами (пароль с кириллицей уронил бы вход).
+    if password and hmac.compare_digest(
+        password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")
+    ):
         st.success("Добро пожаловать в панель администратора!")
-        all_data = pd.read_sql(session.query(Equipment).statement, engine)
+        all_data = pd.read_sql(
+            session.query(Equipment).filter(active_items_filter()).statement, engine
+        )
         history_data = pd.read_sql(session.query(History).statement, engine)
         audit_data = pd.read_sql(session.query(AuditLog).statement, engine)
 
@@ -2466,6 +2559,11 @@ elif role == "Администратор":
                 if not filtered.empty:
                     st.markdown("---")
                     st.markdown("### Удаление позиции из реестра")
+                    st.caption(
+                        "Полное удаление — только для администратора, и оно "
+                        "необратимо. Инженеры вместо удаления списывают технику "
+                        "в архив: запись и вся история по ней остаются."
+                    )
                     del_options = {
                         f"ID {row.id} | Партия: {row.party} | {row.category} — "
                         f"{row.model} (Сер: {row.serial_number})": row.id
