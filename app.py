@@ -1,8 +1,11 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import base64
+import hashlib
+import hmac
 import html as html_lib
 import io
 import os
+import secrets
 
 import pandas as pd
 import streamlit as st
@@ -37,6 +40,8 @@ COL_RU = {
     "inv_number": "Инвентарный номер",
     "quantity": "Кол-во",
     "condition": "Состояние",
+    "complect": "Комплектность",
+    "complect_comment": "Что есть / чего нет",
     "engineer": "Ответственный",
     "date_updated": "Обновлено",
     "equipment_info": "Техника",
@@ -85,6 +90,16 @@ LIMITS_SPECIAL = {"Ноутбук": 2, "Сетевой фильтр": 2}
 DEFAULT_LIMIT = 1
 BASE_PARTY = "База"
 BAD_ROW_STYLE = "background-color: #ffe1e1; color: #a40000; font-weight: 600"
+# «Не комплект» — не поломка, но требует внимания: подсвечиваем жёлтым.
+COMPLECT_ROW_STYLE = "background-color: #fff3cd; color: #8a5a00; font-weight: 600"
+
+# Категории, у которых отмечается комплектность. Для «Не комплект» обязателен
+# комментарий: что есть, а чего не хватает.
+COMPLECT_CATEGORIES = ["Усилитель сотовой связи"]
+COMPLECT_FULL = "Комплект"
+COMPLECT_PARTIAL = "Не комплект"
+COMPLECT_OPTIONS = [COMPLECT_FULL, COMPLECT_PARTIAL]
+COMPLECT_COLUMN = "Комплектность"
 
 
 def category_limit(category):
@@ -113,14 +128,24 @@ def condition_text(value):
     return text
 
 
-def style_conditions(df, condition_col="Состояние"):
-    """Красит строки с неудовлетворительным состоянием красным."""
+def style_conditions(df, condition_col="Состояние", complect_col=COMPLECT_COLUMN):
+    """Красит красным неудовлетворительное состояние, жёлтым — «не комплект»."""
     if df is None or df.empty:
         return df
 
     def row_style(row):
         bad = is_bad_condition(row.get(condition_col, ""))
-        return [BAD_ROW_STYLE if bad else "" for _ in row]
+        styles = []
+        for col in row.index:
+            if bad:
+                styles.append(BAD_ROW_STYLE)
+            elif col == complect_col and str(row.get(col, "")).startswith(
+                COMPLECT_PARTIAL
+            ):
+                styles.append(COMPLECT_ROW_STYLE)
+            else:
+                styles.append("")
+        return styles
 
     return df.style.apply(row_style, axis=1)
 
@@ -243,6 +268,8 @@ def describe_changes(old_values, new_values):
         "inv_number": "Инвентарный номер",
         "quantity": "Количество",
         "condition": "Состояние",
+        "complect": "Комплектность",
+        "complect_comment": "Что есть / чего нет",
     }
     parts = []
     for key, label in labels.items():
@@ -340,6 +367,21 @@ def render_item_card(item, session):
     state_color = "#dc2626" if bad else "#16a34a"
     qr_url = item_qr_url(item.id)
 
+    # Комплектность показываем, если она отмечена (усилители сотовой связи).
+    complect_row = ""
+    if cell_text(item.complect):
+        complect_color = (
+            "#b45309"
+            if cell_text(item.complect) == COMPLECT_PARTIAL
+            else "#16a34a"
+        )
+        complect_row = (
+            "<tr><td>Комплектность</td>"
+            f'<td style="color:{complect_color};font-weight:700">'
+            f"{_esc(complect_display(item.complect, item.complect_comment))}"
+            "</td></tr>"
+        )
+
     st.markdown(
         f"""
         <div class="item-card">
@@ -353,6 +395,7 @@ def render_item_card(item, session):
             <tr><td>Состояние</td>
                 <td style="color:{state_color};font-weight:700">
                     {_esc(item.condition)}</td></tr>
+            {complect_row}
             <tr><td>Ответственный</td><td>{_esc(item.engineer)}</td></tr>
             <tr><td>Обновлено</td><td>{_esc(item.date_updated)}</td></tr>
           </table>
@@ -718,6 +761,10 @@ class Equipment(Base):
     condition = Column(String)
     engineer = Column(String)
     date_updated = Column(String)
+    # Комплектность (усилители сотовой связи): «Комплект» / «Не комплект» и
+    # комментарий, что есть и чего не хватает, если не комплект.
+    complect = Column(String)
+    complect_comment = Column(String)
 
 
 class LaptopReference(Base):
@@ -763,6 +810,35 @@ class AuditLog(Base):
     details = Column(String)
 
 
+class PartyAccess(Base):
+    """Пароль партии: хранится только хэшем (PBKDF2-SHA256, соль на партию).
+
+    Открытый пароль в базе не лежит — посмотреть его нельзя, можно только задать
+    новый. Нет строки для партии — вход в её кабинет закрыт.
+    """
+
+    __tablename__ = "party_access"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    party = Column(String, unique=True)
+    password_hash = Column(String)
+    updated_at = Column(String)
+
+
+class PartySession(Base):
+    """Кто и когда подтверждал фамилию в партии.
+
+    Отсюда работает правило «уточнять фамилию один раз в сутки» и собирается
+    список инженеров, которые уже работали в этой партии.
+    """
+
+    __tablename__ = "party_session"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    party = Column(String)
+    fio = Column(String)
+    confirmed_date = Column(String)  # YYYY-MM-DD — по нему «раз в сутки»
+    confirmed_at = Column(String)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -782,6 +858,386 @@ def migrate_history_schema():
 
 
 migrate_history_schema()
+
+
+def migrate_equipment_schema():
+    """Добавляет колонки комплектности в существующую таблицу позиций.
+
+    create_all новые колонки в уже созданной таблице не добавляет, поэтому
+    расширяем её сами. Работает и в SQLite, и в Postgres; данные не теряются.
+    """
+    if not inspect(engine).has_table("equipment"):
+        return
+    existing = {c["name"] for c in inspect(engine).get_columns("equipment")}
+    with engine.begin() as conn:
+        if "complect" not in existing:
+            conn.execute(text("ALTER TABLE equipment ADD COLUMN complect VARCHAR"))
+        if "complect_comment" not in existing:
+            conn.execute(
+                text("ALTER TABLE equipment ADD COLUMN complect_comment VARCHAR")
+            )
+
+
+migrate_equipment_schema()
+
+
+# --- КОМПЛЕКТНОСТЬ (усилители сотовой связи) ---
+def needs_complect(category):
+    """Нужно ли у этой категории отмечать комплектность."""
+    return category in COMPLECT_CATEGORIES
+
+
+def cell_text(value):
+    """Текст из ячейки таблицы: None и NaN — пустая строка, а не «nan»."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def complect_display(complect, complect_comment=""):
+    """Комплектность для таблиц: «Комплект» / «Не комплект: нет кабеля 5 м»."""
+    value = cell_text(complect)
+    if not value:
+        return "—"
+    note = cell_text(complect_comment)
+    if value == COMPLECT_PARTIAL and note:
+        return f"{value}: {note}"
+    return value
+
+
+def validate_complect(category, complect, complect_comment=""):
+    """Проверка комплектности. Возвращает (ok, текст ошибки)."""
+    if not needs_complect(category):
+        return True, ""
+    if complect not in COMPLECT_OPTIONS:
+        return False, "Укажите комплектность: «Комплект» или «Не комплект»."
+    if complect == COMPLECT_PARTIAL and not cell_text(complect_comment):
+        return False, (
+            "Для «Не комплект» напишите в комментарии, что есть, а чего не хватает."
+        )
+    return True, ""
+
+
+def with_complect_column(df):
+    """Добавляет колонку «Комплектность» сразу после «Состояния».
+
+    Показываем и сам факт (комплект/не комплект), и комментарий — чтобы в списке
+    сразу было видно, чего не хватает.
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    complects = (
+        df["complect"]
+        if "complect" in df.columns
+        else pd.Series([""] * len(df), index=df.index)
+    )
+    comments = (
+        df["complect_comment"]
+        if "complect_comment" in df.columns
+        else pd.Series([""] * len(df), index=df.index)
+    )
+    df[COMPLECT_COLUMN] = [
+        complect_display(complect, comment)
+        for complect, comment in zip(complects, comments)
+    ]
+    if "condition" in df.columns:
+        columns = list(df.columns)
+        columns.remove(COMPLECT_COLUMN)
+        columns.insert(columns.index("condition") + 1, COMPLECT_COLUMN)
+        df = df[columns]
+    return df
+
+
+# --- ДОСТУП ПО ПАРТИЯМ (пароль партии + подтверждение фамилии) ---
+def hash_party_password(password, salt=None):
+    """Пароль партии хранится только хэшем: PBKDF2-SHA256, соль своя у каждой партии."""
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", (password or "").encode("utf-8"), bytes.fromhex(salt), 120_000
+    )
+    return f"pbkdf2_sha256${salt}${digest.hex()}"
+
+
+def check_party_password(stored_hash, password):
+    """Сверяет пароль с сохранённым хэшем (сравнение с защитой от тайминга)."""
+    if not stored_hash or not password:
+        return False
+    parts = str(stored_hash).split("$")
+    if len(parts) != 3 or parts[0] != "pbkdf2_sha256":
+        return False
+    return hmac.compare_digest(hash_party_password(password, parts[1]), stored_hash)
+
+
+def generate_party_password():
+    """Пароль, который легко продиктовать: 3 группы по 4 знака.
+    Алфавит без похожих символов (0/O, 1/I/L, 8/B), чтобы не путать на слух."""
+    alphabet = "ACDEFGHJKMNPQRTUVWXY34679"
+    return "-".join(
+        "".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3)
+    )
+
+
+def party_access_row(session, party):
+    return session.query(PartyAccess).filter(PartyAccess.party == party).first()
+
+
+def party_password_is_set(session, party):
+    """Задан ли пароль у партии. Нет строки — вход закрыт (fail-closed)."""
+    return party_access_row(session, party) is not None
+
+
+def set_party_password(session, party, password):
+    """Задать/сменить пароль партии. Открытый пароль нигде не сохраняем."""
+    row = party_access_row(session, party)
+    if row is None:
+        row = PartyAccess(party=party)
+        session.add(row)
+    row.password_hash = hash_party_password(password)
+    row.updated_at = utc_now_str()
+    session.commit()
+
+
+def verify_party_login(session, party, password):
+    row = party_access_row(session, party)
+    if row is None:
+        return False
+    return check_party_password(row.password_hash, password)
+
+
+def party_token(session, party, fio):
+    """Подпись для ссылки. Ключ — хэш пароля партии, поэтому подделать ссылку
+    (вписать чужую партию) нельзя, а смена пароля отменяет старые ссылки."""
+    row = party_access_row(session, party)
+    if row is None or not row.password_hash:
+        return ""
+    return hmac.new(
+        row.password_hash.encode("utf-8"),
+        f"{party}|{fio}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:32]
+
+
+def write_party_token(session, party, fio):
+    """Запоминает вход в адресной строке: на телефоне не нужно вводить пароль
+    заново после каждого обновления страницы (Streamlit сбрасывает сессию)."""
+    st.query_params["party"] = party
+    if fio:
+        st.query_params["fio"] = fio
+    elif "fio" in st.query_params:
+        del st.query_params["fio"]
+    st.query_params["sig"] = party_token(session, party, fio)
+
+
+def read_party_token(session):
+    """(партия, ФИО) из адресной строки — только если подпись верна."""
+    party = (st.query_params.get_all("party") or [""])[0]
+    fio = (st.query_params.get_all("fio") or [""])[0]
+    sig = (st.query_params.get_all("sig") or [""])[0]
+    if party not in parties or not sig:
+        return "", ""
+    expected = party_token(session, party, fio)
+    if not expected or not hmac.compare_digest(sig, expected):
+        return "", ""
+    return party, fio
+
+
+def engineers_of_party(session, party):
+    """Фамилии, которые уже работали в этой партии: из позиций и из журнала входов."""
+    names = set()
+    for (name,) in (
+        session.query(Equipment.engineer)
+        .filter(Equipment.party == party)
+        .distinct()
+    ):
+        if name and name.strip():
+            names.add(name.strip())
+    for (name,) in (
+        session.query(PartySession.fio)
+        .filter(PartySession.party == party)
+        .distinct()
+    ):
+        if name and name.strip():
+            names.add(name.strip())
+    return sorted(names)
+
+
+def is_fio_confirmed_today(session, party, fio, today=None):
+    """Фамилия подтверждена сегодня? Тогда второй раз за сутки не спрашиваем."""
+    if not fio:
+        return False
+    today = today or date.today().isoformat()
+    return (
+        session.query(PartySession)
+        .filter(
+            PartySession.party == party,
+            PartySession.fio == fio,
+            PartySession.confirmed_date == today,
+        )
+        .first()
+        is not None
+    )
+
+
+def remember_fio_confirmation(session, party, fio):
+    """Отмечает, что сегодня в партии работает эта фамилия."""
+    today = date.today().isoformat()
+    row = (
+        session.query(PartySession)
+        .filter(
+            PartySession.party == party,
+            PartySession.fio == fio,
+            PartySession.confirmed_date == today,
+        )
+        .first()
+    )
+    if row is None:
+        session.add(
+            PartySession(
+                party=party,
+                fio=fio,
+                confirmed_date=today,
+                confirmed_at=utc_now_str(),
+            )
+        )
+    else:
+        row.confirmed_at = utc_now_str()
+    session.commit()
+
+
+def render_fio_gate(session, party, saved_fio):
+    """Окно «кто сегодня работает».
+
+    Все правки подписываются фамилией, поэтому до подтверждения кабинет закрыт:
+    открыть чужую партию по ссылке можно, а работать в ней — только подтвердив,
+    кто ты. Подтверждается один раз в сутки.
+    """
+    st.markdown(
+        f'<span class="party-chip">📍 {party}</span>', unsafe_allow_html=True
+    )
+    st.subheader("👤 Кто сегодня работает?")
+    st.caption(
+        "Фамилия попадает в журнал действий: все добавления, изменения и списания "
+        "будут подписаны ею. Подтверждать нужно один раз в сутки."
+    )
+
+    known = engineers_of_party(session, party)
+    options = known + ["— ввести другую фамилию —"]
+    default_index = known.index(saved_fio) if saved_fio in known else 0
+    choice = st.selectbox("Ваша фамилия:", options, index=default_index)
+
+    if choice == "— ввести другую фамилию —":
+        fio = st.text_input(
+            "Введите фамилию", value=saved_fio if saved_fio not in known else ""
+        )
+    else:
+        fio = choice
+
+    if st.button(
+        "✅ Подтвердить и продолжить", type="primary", use_container_width=True
+    ):
+        fio = (fio or "").strip()
+        if not fio:
+            st.error("Укажите фамилию — без неё работа в кабинете закрыта.")
+        else:
+            remember_fio_confirmation(session, party, fio)
+            write_party_token(session, party, fio)
+            st.rerun()
+
+
+def render_parties_admin(session):
+    """Вкладка администратора: пароли партий."""
+    st.markdown("### 🔑 Пароли партий")
+    st.caption(
+        "Инженеры входят в кабинет по паролю своей партии. Пароли хранятся "
+        "зашифрованными: посмотреть их нельзя, можно только задать новые. "
+        "После смены пароля все, кто уже вошёл в эту партию, войдут заново "
+        "с новым паролем — предупредите инженеров."
+    )
+
+    configured = {
+        row.party: row.updated_at for row in session.query(PartyAccess).all()
+    }
+    st.write(f"Пароль задан для **{len(configured)}** из {len(parties)} партий.")
+
+    st.markdown("#### Выдать или сменить пароль одной партии")
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        party = st.selectbox("Партия:", parties, key="admin_party_select")
+    with col2:
+        new_password = st.text_input("Новый пароль:", key="admin_party_password")
+
+    c1, c2 = st.columns(2)
+    if c1.button("💾 Сохранить пароль", use_container_width=True):
+        if len((new_password or "").strip()) < 6:
+            st.error("Пароль слишком короткий — минимум 6 знаков.")
+        else:
+            set_party_password(session, party, new_password.strip())
+            st.success(
+                f"Пароль для «{party}» сохранён. Сообщите его инженерам партии."
+            )
+    if c2.button("🎲 Сгенерировать случайный", use_container_width=True):
+        generated = generate_party_password()
+        set_party_password(session, party, generated)
+        st.success(
+            f"Новый пароль для «{party}»: **{generated}** — передайте его "
+            "инженерам партии. Показывается один раз."
+        )
+
+    st.markdown("---")
+    st.markdown("#### Выдать пароли всем партиям сразу")
+    st.caption(
+        "Удобно при первом запуске: получите список паролей и разошлите по партиям."
+    )
+    if st.button(
+        "🎲 Сгенерировать пароли для всех партий", use_container_width=True
+    ):
+        rows = []
+        for p in parties:
+            generated = generate_party_password()
+            set_party_password(session, p, generated)
+            rows.append({"Партия": p, "Пароль": generated})
+        st.session_state["generated_party_passwords"] = rows
+
+    generated_rows = st.session_state.get("generated_party_passwords")
+    if generated_rows:
+        st.warning(
+            "⚠️ Пароли показываются один раз — скачайте список или распечатайте. "
+            "Восстановить их потом нельзя: в базе только хэш."
+        )
+        table_df = pd.DataFrame(generated_rows)
+        st.dataframe(table_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Скачать список паролей (CSV)",
+            data=table_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="пароли_партий.csv",
+            mime="text/csv",
+        )
+        if st.button("Скрыть список паролей"):
+            del st.session_state["generated_party_passwords"]
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### Состояние паролей")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Партия": p,
+                    "Пароль задан": "да" if p in configured else "нет",
+                    "Обновлён": configured.get(p, "—"),
+                }
+                for p in parties
+            ]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 # Автоматическая загрузка ноутбуков из Excel
@@ -1094,59 +1550,59 @@ role = st.sidebar.selectbox("Режим работы:", ["Инженер", "Ад
 
 current_engineer = ""
 selected_party = ""
+entered_party = ""
+entered_fio = ""
 
 if role == "Инженер":
-    # Восстановление партии и ФИО из адресной строки (?party=...&fio=...):
-    # инженер, вернувшийся по закладке/истории браузера, попадает сразу в свою
-    # партию с уже заполненным ФИО.
-    q_party = (st.query_params.get_all("party") or [""])[0]
-    q_fio = (st.query_params.get_all("fio") or [""])[0]
+    # --- ВХОД В КАБИНЕТ ПАРТИИ ---
+    # Партия берётся из ПОДТВЕРЖДЁННОГО входа (подписанная ссылка), а не из
+    # свободного выбора в списке: без пароля чужой партии в её кабинет не попасть.
+    entered_party, entered_fio = read_party_token(session)
 
-    party_index = parties.index(q_party) if q_party in parties else 0
-    selected_party = st.sidebar.selectbox(
-        "Выберите вашу партию:", parties, index=party_index
-    )
-
-    if (
-        "last_party" not in st.session_state
-        or st.session_state["last_party"] != selected_party
-    ):
-        st.session_state["last_party"] = selected_party
-        # ФИО подставляем только если в URL та же партия (тот же контекст)
-        st.session_state["engineer_name"] = (
-            q_fio if q_party == selected_party else ""
+    if not entered_party:
+        st.sidebar.subheader("🔑 Вход в кабинет партии")
+        login_party = st.sidebar.selectbox("Ваша партия:", parties)
+        login_password = st.sidebar.text_input(
+            "Пароль партии:", type="password", key="party_password_input"
         )
+        if st.sidebar.button("Войти", use_container_width=True):
+            if verify_party_login(session, login_party, login_password):
+                entered_party, entered_fio = login_party, ""
+                write_party_token(session, login_party, "")
+            elif not party_password_is_set(session, login_party):
+                st.sidebar.warning(
+                    "Для этой партии пароль ещё не задан — обратитесь к "
+                    "администратору."
+                )
+            else:
+                st.sidebar.error("Неверный пароль партии.")
 
-    current_engineer = st.sidebar.text_input(
-        "ФИО ответственного инженера:",
-        value=st.session_state["engineer_name"],
-        key="eng_input_field",
-    )
-    st.session_state["engineer_name"] = current_engineer
-
-    # Сохраняем выбор в адресную строку, чтобы он пережил перезагрузку страницы
-    if (st.query_params.get_all("party") or [""])[0] != selected_party:
-        st.query_params["party"] = selected_party
-    url_fio = (st.query_params.get_all("fio") or [""])[0]
-    if current_engineer and url_fio != current_engineer:
-        st.query_params["fio"] = current_engineer
-    elif not current_engineer and "fio" in st.query_params:
-        del st.query_params["fio"]
+    if entered_party:
+        selected_party = entered_party
+        # Работать можно только с подтверждённой фамилией — она подписывает
+        # все действия в журнале. Подтверждается один раз в сутки.
+        if entered_fio and is_fio_confirmed_today(
+            session, entered_party, entered_fio
+        ):
+            current_engineer = entered_fio
 
 if role == "Инженер":
-    st.markdown(
-        f'<span class="party-chip">📍 {selected_party}</span>',
-        unsafe_allow_html=True,
-    )
-
-    if not current_engineer:
+    if not entered_party:
+        st.info(
+            "👈 Чтобы начать работу, выберите свою партию и введите пароль "
+            "в меню слева."
+        )
+    elif not current_engineer:
+        render_fio_gate(session, entered_party, entered_fio)
+    else:
         st.markdown(
-            '<div class="device-hint">⚠️ <b>Внимание!</b> Нажмите на стрелочку '
-            '<b>&gt; (меню)</b> в верхнем левом углу экрана и укажите ваше '
-            '<b>ФИО</b> для продолжения работы!</div>',
+            f'<span class="party-chip">📍 {selected_party}</span>',
             unsafe_allow_html=True,
         )
-    else:
+        st.caption(
+            f"Работает: **{current_engineer}**. Фамилия подтверждена на сегодня — "
+            "все действия в журнале подписываются ею."
+        )
         tab1, tab2, tab3 = st.tabs(
             ["📋 Список", "➕ Добавить", "🚚 Переместить"]
         )
@@ -1159,9 +1615,10 @@ if role == "Инженер":
                 engine,
             )
             if not data.empty:
+                list_view = with_complect_column(data)
                 st.dataframe(
                     style_conditions(
-                        data[
+                        list_view[
                             [
                                 "category",
                                 "model",
@@ -1169,6 +1626,7 @@ if role == "Инженер":
                                 "inv_number",
                                 "quantity",
                                 "condition",
+                                COMPLECT_COLUMN,
                                 "engineer",
                                 "date_updated",
                             ]
@@ -1229,6 +1687,24 @@ if role == "Инженер":
                             "Описание неисправности (только для «Не удовлетворительно»)",
                             value=item.condition if cur_bad else "",
                         )
+                        if needs_complect(item.category):
+                            new_complect = st.selectbox(
+                                "Комплектность",
+                                COMPLECT_OPTIONS,
+                                index=1
+                                if cell_text(item.complect) == COMPLECT_PARTIAL
+                                else 0,
+                            )
+                            new_complect_comment = st.text_input(
+                                "Что есть и чего не хватает (обязательно для "
+                                "«Не комплект»)",
+                                value=item.complect_comment or "",
+                            )
+                        else:
+                            new_complect = cell_text(item.complect)
+                            new_complect_comment = cell_text(
+                                item.complect_comment
+                            )
                         save_clicked = st.form_submit_button(
                             "💾 Сохранить изменения", use_container_width=True
                         )
@@ -1248,6 +1724,12 @@ if role == "Инженер":
                             final_condition = new_comment.strip()
                         else:
                             final_condition = "Удовлетворительно"
+
+                        complect_ok, complect_err = validate_complect(
+                            item.category, new_complect, new_complect_comment
+                        )
+                        if err is None and not complect_ok:
+                            err = complect_err
 
                         dup = None
                         if new_serial.strip() and new_serial.strip() != "-":
@@ -1285,12 +1767,20 @@ if role == "Инженер":
                                 "inv_number": item.inv_number,
                                 "quantity": item.quantity,
                                 "condition": item.condition,
+                                "complect": item.complect,
+                                "complect_comment": item.complect_comment,
                             }
                             item.model = new_model.strip() or item.model
                             item.serial_number = new_serial.strip() or "-"
                             item.inv_number = new_inv.strip() or "-"
                             item.quantity = int(new_qty)
                             item.condition = final_condition
+                            item.complect = new_complect
+                            item.complect_comment = (
+                                cell_text(new_complect_comment)
+                                if new_complect == COMPLECT_PARTIAL
+                                else ""
+                            )
                             item.engineer = current_engineer
                             item.date_updated = utc_now_str()
                             new_values = {
@@ -1299,6 +1789,8 @@ if role == "Инженер":
                                 "inv_number": item.inv_number,
                                 "quantity": item.quantity,
                                 "condition": item.condition,
+                                "complect": item.complect,
+                                "complect_comment": item.complect_comment,
                             }
                             log_action(
                                 session,
@@ -1356,18 +1848,42 @@ if role == "Инженер":
         with tab2:
             st.markdown("### Добавить оргтехнику")
             all_categories = cats_with_identifiers + cats_with_qty
-            cat = st.selectbox("Категория техники", all_categories)
+            cat = st.selectbox(
+                "Категория техники", all_categories, key="add_category"
+            )
 
             # Выбор состояния и обязательный комментарий при неудовлетворительном
             cond_option = st.selectbox(
-                "Состояние", ["Удовлетворительно", "Не удовлетворительно"]
+                "Состояние",
+                ["Удовлетворительно", "Не удовлетворительно"],
+                key="add_condition",
             )
             if cond_option == "Не удовлетворительно":
                 cond_comment = st.text_input(
-                    "⚠️ Опишите неисправность (обязательно):"
+                    "⚠️ Опишите неисправность (обязательно):",
+                    key="add_cond_comment",
                 )
             else:
                 cond_comment = "Удовлетворительно"
+
+            # Комплектность — для усилителей сотовой связи (COMPLECT_CATEGORIES).
+            # «Не комплект» без описания не сохраняем: должно быть видно, чего нет.
+            complect_value, complect_comment_value = "", ""
+            if needs_complect(cat):
+                complect_value = st.radio(
+                    "Комплектность:",
+                    COMPLECT_OPTIONS,
+                    horizontal=True,
+                    key="add_complect",
+                )
+                if complect_value == COMPLECT_PARTIAL:
+                    complect_comment_value = st.text_input(
+                        "Что есть и чего не хватает (обязательно):",
+                        key="add_complect_comment",
+                        placeholder=(
+                            "Например: есть блок питания и антенна, нет кабеля 5 м"
+                        ),
+                    )
 
             # Логика для техники с серийными/инвентарными номерами
             if cat in cats_with_identifiers:
@@ -1421,14 +1937,19 @@ if role == "Инженер":
                         "Модель ноутбука",
                         value=auto_model,
                         placeholder="Введите или выберите выше",
+                        key="add_laptop_model",
                     )
-                    serial = st.text_input("Серийный номер", value=auto_serial)
-                    inv = st.text_input("Инвентарный номер", value=auto_inv)
+                    serial = st.text_input(
+                        "Серийный номер", value=auto_serial, key="add_serial"
+                    )
+                    inv = st.text_input(
+                        "Инвентарный номер", value=auto_inv, key="add_inv"
+                    )
 
                 elif cat == "Роутер Huawei":
                     model = "Роутер Huawei"
-                    serial = st.text_input("Серийный номер")
-                    inv = st.text_input("Инвентарный номер")
+                    serial = st.text_input("Серийный номер", key="add_serial")
+                    inv = st.text_input("Инвентарный номер", key="add_inv")
 
                 else:
                     custom_db = (
@@ -1441,14 +1962,24 @@ if role == "Инженер":
                     model = st.selectbox(
                         "Модель (из сохраненных или новая)",
                         [""] + saved_models,
+                        key="add_model_select",
                     )
                     if not model:
-                        model = st.text_input("Или введите модель вручную:")
+                        model = st.text_input(
+                            "Или введите модель вручную:", key="add_model_manual"
+                        )
 
-                    serial = st.text_input("Серийный номер")
-                    inv = st.text_input("Инвентарный номер")
+                    serial = st.text_input("Серийный номер", key="add_serial")
+                    inv = st.text_input("Инвентарный номер", key="add_inv")
 
-                if st.button("Сохранить позицию", use_container_width=True):
+                if st.button(
+                    "Сохранить позицию",
+                    use_container_width=True,
+                    key="add_save_identified",
+                ):
+                    complect_ok, complect_err = validate_complect(
+                        cat, complect_value, complect_comment_value
+                    )
                     if (
                         cond_option == "Не удовлетворительно"
                         and not cond_comment.strip()
@@ -1456,6 +1987,8 @@ if role == "Инженер":
                         st.error(
                             "❌ Ошибка: Обязательно укажите описание неисправности!"
                         )
+                    elif not complect_ok:
+                        st.error("❌ Ошибка: " + complect_err)
                     else:
                         is_model_valid = bool(
                             model
@@ -1519,6 +2052,10 @@ if role == "Инженер":
                                     condition=cond_comment,
                                     engineer=current_engineer,
                                     date_updated=utc_now_str(),
+                                    complect=complect_value or None,
+                                    complect_comment=(
+                                        cell_text(complect_comment_value) or None
+                                    ),
                                 )
                                 session.add(new_item)
                                 log_action(
@@ -1533,10 +2070,14 @@ if role == "Инженер":
                                 st.rerun()
 
             else:
-                qty = st.number_input("Количество (шт.)", min_value=1, value=1)
+                qty = st.number_input(
+                    "Количество (шт.)", min_value=1, value=1, key="add_qty"
+                )
 
                 if st.button(
-                    "Сохранить количество", use_container_width=True
+                    "Сохранить количество",
+                    use_container_width=True,
+                    key="add_save_qty",
                 ):
                     if (
                         cond_option == "Не удовлетворительно"
@@ -1648,7 +2189,7 @@ elif role == "Администратор":
 
     # Пароль хранится в секретах Streamlit (App → Settings → Secrets → admin_password),
     # а не в коде. Если секрет не настроен — вход невозможен.
-    ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "") or st.secrets.get("admin_password", "")
+    ADMIN_PASSWORD = st.secrets.get("admin_password", "")
 
     if not ADMIN_PASSWORD:
         st.error(
@@ -1667,8 +2208,14 @@ elif role == "Администратор":
         history_data = pd.read_sql(session.query(History).statement, engine)
         audit_data = pd.read_sql(session.query(AuditLog).statement, engine)
 
-        tab_dash, tab_all, tab_hist, tab_move = st.tabs(
-            ["📊 Сводка", "📁 Реестр", "📜 История", "🚚 Переместить"]
+        tab_dash, tab_all, tab_hist, tab_move, tab_parties = st.tabs(
+            [
+                "📊 Сводка",
+                "📁 Реестр",
+                "📜 История",
+                "🚚 Переместить",
+                "🔑 Пароли партий",
+            ]
         )
 
         with tab_dash:
@@ -1867,7 +2414,7 @@ elif role == "Администратор":
                                 "инвентарный номер, ответственный…",
                 )
 
-                filtered = all_data.copy()
+                filtered = with_complect_column(all_data)
                 if party_filter:
                     filtered = filtered[filtered["party"].isin(party_filter)]
                 if cat_filter:
@@ -1884,6 +2431,8 @@ elif role == "Администратор":
                         | filtered["engineer"].astype(str).str.lower()
                         .str.contains(q, regex=False, na=False)
                         | filtered["category"].astype(str).str.lower()
+                        .str.contains(q, regex=False, na=False)
+                        | filtered[COMPLECT_COLUMN].astype(str).str.lower()
                         .str.contains(q, regex=False, na=False)
                     )
                     filtered = filtered[mask]
@@ -2206,6 +2755,9 @@ elif role == "Администратор":
                                     st.rerun()
             else:
                 st.info("В реестре нет техники для перемещения.")
+
+        with tab_parties:
+            render_parties_admin(session)
 
     else:
         if password != "":
