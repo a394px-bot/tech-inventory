@@ -101,6 +101,16 @@ COMPLECT_PARTIAL = "Не комплект"
 COMPLECT_OPTIONS = [COMPLECT_FULL, COMPLECT_PARTIAL]
 COMPLECT_COLUMN = "Комплектность"
 
+# Категории, по которым в сводке показываем «всего / исправны / неисправны» —
+# то же, что и по ноутбукам (ноутбуки выводятся отдельным блоком).
+# (категория в базе, значок, подпись под числом «всего»)
+CONTROL_CATEGORIES = [
+    ("Роутер Huawei", "📡", "Всего роутеров Huawei"),
+    ("Усилитель сотовой связи", "📶", "Всего усилителей сотовой связи"),
+    ("Стабилизатор напряжения", "⚡", "Всего стабилизаторов напряжения"),
+    ("ИБП", "🔋", "Всего ИБП"),
+]
+
 
 def category_limit(category):
     """Максимальное число единиц категории в одной партии."""
@@ -170,17 +180,36 @@ def style_violations(df, bad_col="Неудовлетворительные"):
     return df.style.apply(row_style, axis=1)
 
 
-def laptops_summary(df):
-    """Сколько всего ноутбуков, сколько исправных и сколько нет."""
+def category_summary(df, category):
+    """Сколько всего единиц категории, сколько исправных и сколько неисправных."""
     if df is None or df.empty or "category" not in df:
         return {"total": 0, "ok": 0, "bad": 0}
-    lap = df[df["category"] == "Ноутбук"]
-    if lap.empty:
+    part = df[df["category"] == category]
+    if part.empty:
         return {"total": 0, "ok": 0, "bad": 0}
-    qty = pd.to_numeric(lap["quantity"], errors="coerce").fillna(0).astype(int)
+    qty = pd.to_numeric(part["quantity"], errors="coerce").fillna(0).astype(int)
     total = int(qty.sum())
-    bad = int(qty[lap["condition"].map(is_bad_condition)].sum())
+    bad = int(qty[part["condition"].map(is_bad_condition)].sum())
     return {"total": total, "ok": total - bad, "bad": bad}
+
+
+def laptops_summary(df):
+    """Сколько всего ноутбуков, сколько исправных и сколько нет."""
+    return category_summary(df, "Ноутбук")
+
+
+def category_stats_html(total_label, stats):
+    """Карточки «всего / исправны / неисправны» — тот же вид, что у ноутбуков."""
+    return (
+        '<div class="laptop-stats">'
+        f'<div class="ls-card"><div class="ls-val">{stats["total"]}</div>'
+        f'<div class="ls-label">{total_label}</div></div>'
+        f'<div class="ls-card ok"><div class="ls-val">{stats["ok"]}</div>'
+        '<div class="ls-label">Исправны</div></div>'
+        f'<div class="ls-card bad"><div class="ls-val">{stats["bad"]}</div>'
+        '<div class="ls-label">Неисправны</div></div>'
+        "</div>"
+    )
 
 
 def find_limit_violations(df, with_details=True):
@@ -610,6 +639,17 @@ def build_dashboard_html(df):
                 row["inv_number"], mark, row["engineer"],
             ])
 
+    # Техника под контролем (кроме ноутбуков): всего / исправны / неисправны
+    control_rows = []
+    for control_category, _control_emoji, _control_label in CONTROL_CATEGORIES:
+        control_stats = category_summary(df, control_category)
+        control_rows.append([
+            control_category,
+            control_stats["total"],
+            control_stats["ok"],
+            control_stats["bad"],
+        ])
+
     # Сводка по партиям
     if df.empty:
         summary_rows = []
@@ -732,6 +772,11 @@ def build_dashboard_html(df):
   <div class="panel">{_table(
       ["Партия", "Модель", "Серийный №", "Инвентарный №", "Состояние",
        "Ответственный"], lap_rows, "Ноутбуков нет")}</div>
+
+  <h2>🔧 Техника под контролем</h2>
+  <div class="panel">{_table(
+      ["Категория", "Всего", "Исправны", "Неисправны"],
+      control_rows, "Данных нет")}</div>
 
   <h2>📊 Сводка по партиям</h2>
   <div class="panel">{_table(["Партия"] + cat_cols, summary_rows,
@@ -950,7 +995,10 @@ def complect_display(complect, complect_comment=""):
     return value
 
 
-# --- СПИСАНИЕ В АРХИВ ---
+# --- СПИСАННАЯ ТЕХНИКА (списание — только у администратора) ---
+# Инженеры ошибочные записи удаляют (факт удаления остаётся в истории), а списывать
+# технику в архив может администратор: запись не стирается, видно кто и когда списал,
+# из списков, отчётов и лимитов такая позиция уходит.
 def active_items_filter():
     """Условие «позиция в строю»: списанные в архив в списки и отчёты не попадают.
     NULL трактуем как «в строю», чтобы старые записи не потерялись."""
@@ -1620,6 +1668,32 @@ if qr_item_param.isdigit():
     session.close()
     st.stop()
 
+# --- ОЧИСТКА ФОРМЫ ДОБАВЛЕНИЯ И ВЫХОД ИЗ КАБИНЕТА ---
+# После сохранения позиции поля формы очищаются: иначе инженер заполняет следующую
+# позицию старыми данными и путается. Флаг ставим в момент сохранения, а чистим
+# ключи виджетов в начале следующего прогона — иначе Streamlit не даёт менять
+# значения уже созданных виджетов.
+ADD_FORM_KEYS = (
+    "add_category",
+    "add_condition",
+    "add_cond_comment",
+    "add_complect",
+    "add_complect_comment",
+    "add_model_select",
+    "add_model_manual",
+    "add_serial",
+    "add_inv",
+    "add_qty",
+)
+
+if st.session_state.pop("reset_add_form", False):
+    for _form_key in ADD_FORM_KEYS:
+        st.session_state.pop(_form_key, None)
+
+if st.session_state.pop("admin_logout", False):
+    # Пароль администратора забываем: ключ виджета очищаем до его создания.
+    st.session_state["admin_password_input"] = ""
+
 # --- БОКОВАЯ ПАНЕЛЬ НАВИГАЦИИ ---
 st.sidebar.header("Параметры сеанса")
 role = st.sidebar.selectbox("Режим работы:", ["Инженер", "Администратор"])
@@ -1655,6 +1729,14 @@ if role == "Инженер":
 
     if entered_party:
         selected_party = entered_party
+        if st.sidebar.button(
+            "🚪 Выйти из кабинета", use_container_width=True, key="party_logout"
+        ):
+            # Выход: забываем подписанную ссылку, пароль и подтверждённую фамилию.
+            st.query_params.clear()
+            st.session_state.pop("party_password_input", None)
+            st.session_state.pop("add_notice", None)
+            st.rerun()
         # Работать можно только с подтверждённой фамилией — она подписывает
         # все действия в журнале. Подтверждается один раз в сутки.
         if entered_fio and is_fio_confirmed_today(
@@ -1785,14 +1867,14 @@ if role == "Инженер":
                         save_clicked = st.form_submit_button(
                             "💾 Сохранить изменения", use_container_width=True
                         )
-                        st.markdown("**Списание в архив**")
+                        st.markdown("**Удаление позиции**")
                         st.caption(
-                            "Запись не стирается: техника уходит из списка, а в "
-                            "журнале остаётся, кто и когда её списал."
+                            "Запись удаляется безвозвратно, но факт удаления "
+                            "сохраняется в истории: видно, кто и когда её удалил."
                         )
-                        confirm_del = st.checkbox("Подтверждаю списание позиции")
+                        confirm_del = st.checkbox("Подтверждаю удаление позиции")
                         delete_clicked = st.form_submit_button(
-                            "📦 Списать в архив", use_container_width=True
+                            "🗑️ Удалить позицию", use_container_width=True
                         )
 
                     if save_clicked:
@@ -1888,19 +1970,24 @@ if role == "Инженер":
                     if delete_clicked:
                         if not confirm_del:
                             st.error(
-                                "❌ Отметьте «Подтверждаю списание», чтобы "
-                                "списать позицию в архив."
+                                "❌ Отметьте «Подтверждаю удаление», чтобы "
+                                "удалить позицию."
                             )
                         else:
-                            archive_item(
+                            log_action(
                                 session,
+                                "Удаление",
                                 item,
                                 current_engineer,
-                                "Позиция списана в архив инженером",
+                                "Позиция удалена инженером",
                             )
+                            session.query(Equipment).filter(
+                                Equipment.id == item.id
+                            ).delete()
+                            session.commit()
                             st.success(
-                                "Позиция списана в архив. Запись сохранена — "
-                                "её видно в журнале действий."
+                                "Позиция удалена. Запись об удалении осталась "
+                                "в истории действий."
                             )
                             st.rerun()
 
@@ -1927,6 +2014,14 @@ if role == "Инженер":
 
         with tab2:
             st.markdown("### Добавить оргтехнику")
+            # Подтверждение последнего сохранения живёт до следующего действия:
+            # инженер видит, что позиция действительно добавлена, и что поля чистые.
+            add_notice = st.session_state.get("add_notice")
+            if add_notice:
+                st.success("✅ " + add_notice)
+                if st.button("✖ Скрыть сообщение", key="hide_add_notice"):
+                    st.session_state.pop("add_notice", None)
+                    st.rerun()
             all_categories = cats_with_identifiers + cats_with_qty
             cat = st.selectbox(
                 "Категория техники", all_categories, key="add_category"
@@ -2148,8 +2243,15 @@ if role == "Инженер":
                                     current_engineer,
                                     "Позиция добавлена инженером",
                                 )
+                                notice_text = (
+                                    f"Позиция добавлена: {new_item.category} — "
+                                    f"{new_item.model} (серийный номер "
+                                    f"{new_item.serial_number}), {new_item.party}. "
+                                    "Поля формы очищены — можно вносить следующую."
+                                )
                                 session.commit()
-                                st.success("Успешно добавлено!")
+                                st.session_state["add_notice"] = notice_text
+                                st.session_state["reset_add_form"] = True
                                 st.rerun()
 
             else:
@@ -2189,8 +2291,14 @@ if role == "Инженер":
                             current_engineer,
                             "Позиция добавлена инженером",
                         )
+                        notice_text = (
+                            f"Позиция добавлена: {new_item.category} — "
+                            f"{new_item.quantity} шт, {new_item.party}. "
+                            "Поля формы очищены — можно вносить следующую."
+                        )
                         session.commit()
-                        st.success("Успешно добавлено!")
+                        st.session_state["add_notice"] = notice_text
+                        st.session_state["reset_add_form"] = True
                         st.rerun()
 
         with tab3:
@@ -2286,7 +2394,9 @@ elif role == "Администратор":
         st.stop()
 
     password = st.sidebar.text_input(
-        "Введите пароль администратора", type="password"
+        "Введите пароль администратора",
+        type="password",
+        key="admin_password_input",
     )
 
     # Сравниваем как байты: hmac.compare_digest не принимает строки с не-ASCII
@@ -2294,6 +2404,12 @@ elif role == "Администратор":
     if password and hmac.compare_digest(
         password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")
     ):
+        if st.sidebar.button(
+            "🚪 Выйти", use_container_width=True, key="admin_logout_button"
+        ):
+            # Пароль забываем в начале следующего прогона (там же, где очистка формы).
+            st.session_state["admin_logout"] = True
+            st.rerun()
         st.success("Добро пожаловать в панель администратора!")
         all_data = pd.read_sql(
             session.query(Equipment).filter(active_items_filter()).statement, engine
@@ -2334,24 +2450,19 @@ elif role == "Администратор":
                 # --- Ноутбуки: всего / исправны / неисправны ---
                 st.markdown("### 💻 Ноутбуки")
                 st.markdown(
-                    f"""
-                    <div class="laptop-stats">
-                      <div class="ls-card">
-                        <div class="ls-val">{lap["total"]}</div>
-                        <div class="ls-label">Всего ноутбуков</div>
-                      </div>
-                      <div class="ls-card ok">
-                        <div class="ls-val">{lap["ok"]}</div>
-                        <div class="ls-label">Исправны</div>
-                      </div>
-                      <div class="ls-card bad">
-                        <div class="ls-val">{lap["bad"]}</div>
-                        <div class="ls-label">Неисправны</div>
-                      </div>
-                    </div>
-                    """,
+                    category_stats_html("Всего ноутбуков", lap),
                     unsafe_allow_html=True,
                 )
+
+                # --- Прочая техника под контролем: всего / исправны / неисправны ---
+                st.markdown("### 🔧 Техника под контролем")
+                for control_category, control_emoji, control_label in CONTROL_CATEGORIES:
+                    control_stats = category_summary(all_data, control_category)
+                    st.markdown(f"#### {control_emoji} {control_category}")
+                    st.markdown(
+                        category_stats_html(control_label, control_stats),
+                        unsafe_allow_html=True,
+                    )
 
                 # --- Превышение лимитов по партиям ---
                 st.markdown("### 🚫 Партии с превышением лимита")
@@ -2558,11 +2669,11 @@ elif role == "Администратор":
 
                 if not filtered.empty:
                     st.markdown("---")
-                    st.markdown("### Удаление позиции из реестра")
+                    st.markdown("### Удалить или списать позицию")
                     st.caption(
-                        "Полное удаление — только для администратора, и оно "
-                        "необратимо. Инженеры вместо удаления списывают технику "
-                        "в архив: запись и вся история по ней остаются."
+                        "**Списать в архив** — запись остаётся в базе (видно, кто и "
+                        "когда списал), но техника уходит из реестра, сводки и лимитов. "
+                        "**Удалить** — безвозвратно; запись об удалении остаётся в истории."
                     )
                     del_options = {
                         f"ID {row.id} | Партия: {row.party} | {row.category} — "
@@ -2570,10 +2681,34 @@ elif role == "Администратор":
                         for _, row in filtered.iterrows()
                     }
                     selected_del_label = st.selectbox(
-                        "Выберите позицию для удаления:",
+                        "Выберите позицию:",
                         list(del_options.keys()),
                     )
-                    if st.button("🗑️ Удалить выбранную позицию"):
+                    action_col1, action_col2 = st.columns(2)
+                    if action_col1.button(
+                        "📦 Списать в архив", use_container_width=True
+                    ):
+                        item_id_to_archive = del_options[selected_del_label]
+                        archive_target = (
+                            session.query(Equipment)
+                            .filter(Equipment.id == item_id_to_archive)
+                            .first()
+                        )
+                        if archive_target:
+                            archive_item(
+                                session,
+                                archive_target,
+                                "Администратор",
+                                "Позиция списана в архив администратором",
+                            )
+                            st.success(
+                                "Позиция списана в архив: из реестра, сводки и "
+                                "лимитов убрана, запись сохранена в истории."
+                            )
+                            st.rerun()
+                    if action_col2.button(
+                        "🗑️ Удалить безвозвратно", use_container_width=True
+                    ):
                         item_id_to_del = del_options[selected_del_label]
                         del_item = (
                             session.query(Equipment)

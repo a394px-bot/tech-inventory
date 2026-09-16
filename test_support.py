@@ -200,6 +200,26 @@ def metric_value(at, label_part):
     return None
 
 
+def category_stats(at, total_label):
+    """Читает из сводки карточки «всего / исправны / неисправны» по категории.
+
+    total_label — подпись под первым числом, например «Всего ИБП».
+    Возвращает (всего, исправны, неисправны) или None, если блок не найден.
+    """
+    import re
+
+    html = " ".join(str(getattr(block, "value", "")) for block in at.markdown)
+    pattern = (
+        r'ls-val">(\d+)</div>\s*<div class="ls-label">'
+        + re.escape(total_label)
+        + r"</div>"
+        r'.*?ls-val">(\d+)</div>\s*<div class="ls-label">Исправны</div>'
+        r'.*?ls-val">(\d+)</div>\s*<div class="ls-label">Неисправны</div>'
+    )
+    found = re.search(pattern, html, re.S)
+    return tuple(int(value) for value in found.groups()) if found else None
+
+
 def login_admin(at, password):
     """Переключает режим на «Администратор» и вводит пароль."""
     at.sidebar.selectbox[0].select("Администратор")
